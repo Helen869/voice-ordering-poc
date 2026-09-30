@@ -1,0 +1,120 @@
+openapi: 3.0.3
+info:
+  title: Golden Wok - Search Menu Tool
+  version: 1.0.0
+  description: >
+    Tool spec for the Golden Wok restaurant voice-ordering POC.
+    Keyword search over the menu - the only safe way to answer "do you have X?".
+servers:
+  - url: https://YOUR-CLOUD-RUN-URL
+    description: Cloud Run FastAPI backend (fill in during setup)
+paths:
+  /tools/menu/search:
+    get:
+      operationId: search_menu
+      summary: Search the menu by keyword
+      description: >
+        Searches the menu for items matching a keyword (case-insensitive, fuzzy).
+        Call this whenever the customer names a dish you have not confirmed is on
+        the menu, or asks "Do you have X?", "What chicken dishes do you have?",
+        or "How much is the Y?". If the customer names something that returns no
+        matches, politely tell them it is not available - NEVER invent the item,
+        a substitute price, or a "closest thing" price from memory. Use the
+        returned item ids for subsequent update_order calls. Use get_menu instead
+        when the customer asks for the full menu or a whole category overview.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: >
+            Search keyword or phrase from the customer's speech, e.g. "chicken",
+            "beef noodles", "cheeseburger". Required - the call fails without it.
+          schema:
+            type: string
+            example: chicken
+      responses:
+        '200':
+          description: Matching menu items (possibly empty)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [query, match_count, matches]
+                properties:
+                  query:
+                    type: string
+                    example: chicken
+                  match_count:
+                    type: integer
+                    description: Number of matching items. Zero means the restaurant does not have it.
+                    example: 3
+                  matches:
+                    type: array
+                    description: Items with the same shape as get_menu items (id, name, description, category, base_price, available, modifiers).
+                    items:
+                      type: object
+                      required: [id, name, description, category, base_price, available, modifiers]
+                      properties:
+                        id:
+                          type: string
+                          example: kung-pao-chicken
+                        name:
+                          type: string
+                          example: Kung Pao Chicken
+                        description:
+                          type: string
+                          example: Stir-fried chicken with peanuts and dried chilies.
+                        category:
+                          type: string
+                          example: Entrees
+                        base_price:
+                          type: number
+                          format: float
+                          example: 13.49
+                        available:
+                          type: boolean
+                          example: true
+                        modifiers:
+                          type: array
+                          items:
+                            type: object
+                            required: [name, required, options]
+                            properties:
+                              name:
+                                type: string
+                                example: spice_level
+                              required:
+                                type: boolean
+                                example: false
+                              default:
+                                type: string
+                                example: medium
+                              options:
+                                type: array
+                                items:
+                                  type: object
+                                  required: [name, price_delta]
+                                  properties:
+                                    name:
+                                      type: string
+                                      example: spicy
+                                    price_delta:
+                                      type: number
+                                      format: float
+                                      example: 0.00
+        '400':
+          description: Missing required query parameter q
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                        example: missing_query
+                      message:
+                        type: string
+                        example: Query parameter 'q' is required.

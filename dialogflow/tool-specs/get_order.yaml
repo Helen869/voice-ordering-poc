@@ -1,0 +1,95 @@
+openapi: 3.0.3
+info:
+  title: Golden Wok - Get Order Tool
+  version: 1.0.0
+  description: >
+    Tool spec for the Golden Wok restaurant voice-ordering POC.
+    Reads the current order state and backend-calculated total.
+servers:
+  - url: https://YOUR-CLOUD-RUN-URL
+    description: Cloud Run FastAPI backend (fill in during setup)
+paths:
+  /tools/order/{session_id}:
+    get:
+      operationId: get_order
+      summary: Get the current order and total
+      description: >
+        Returns the customer's current order: every line with item_id, name,
+        quantity, resolved modifiers, backend-calculated unit_price and
+        line_total, plus item_count and subtotal. Call this before reading the
+        order back to the customer, before quoting any total, before asking for
+        confirmation, and whenever you need to resolve an ambiguous reference
+        ("make the chicken spicy", "another one", "that") against what is
+        actually on the order. An unknown session returns an empty draft order -
+        treat that as "nothing ordered yet". The subtotal here is the ONLY
+        number you may quote as the order total; never compute it yourself.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          description: The Dialogflow session id, passed through unchanged.
+          schema:
+            type: string
+            example: projects/my-project/agent/sessions/abc123
+      responses:
+        '200':
+          description: Current order state (empty draft if session unknown)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session_id, state, currency, items, item_count, subtotal]
+                properties:
+                  session_id:
+                    type: string
+                  state:
+                    type: string
+                    enum: [draft, submitted]
+                    description: >
+                      draft = still editable; submitted = already placed (do not
+                      call update_order or submit_order again for it).
+                    example: draft
+                  currency:
+                    type: string
+                    example: USD
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [item_id, name, quantity, modifiers, unit_price, line_total]
+                      properties:
+                        item_id:
+                          type: string
+                          example: lo-mein
+                        name:
+                          type: string
+                          example: Lo Mein
+                        quantity:
+                          type: integer
+                          example: 1
+                        modifiers:
+                          type: object
+                          additionalProperties:
+                            type: string
+                          example: {protein: chicken}
+                        unit_price:
+                          type: number
+                          format: float
+                          example: 12.49
+                        line_total:
+                          type: number
+                          format: float
+                          example: 12.49
+                  item_count:
+                    type: integer
+                    example: 1
+                  subtotal:
+                    type: number
+                    format: float
+                    description: Backend-calculated total. Quote this verbatim.
+                    example: 12.49
+                  confirmation_number:
+                    type: string
+                    nullable: true
+                    description: Set only after submit_order (e.g. "GW-1042").
+                    example: null

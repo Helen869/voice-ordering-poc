@@ -1,0 +1,221 @@
+openapi: 3.0.3
+info:
+  title: Golden Wok - Update Order Tool
+  version: 1.0.0
+  description: >
+    Tool spec for the Golden Wok restaurant voice-ordering POC.
+    Adds, removes, or modifies order lines. The backend validates everything and
+    computes all prices - the agent never validates or prices anything itself.
+servers:
+  - url: https://YOUR-CLOUD-RUN-URL
+    description: Cloud Run FastAPI backend (fill in during setup)
+paths:
+  /tools/order/update:
+    post:
+      operationId: update_order
+      summary: Add, remove, or modify an item in the order
+      description: >
+        Changes the customer's order. Call this for every add, removal, quantity
+        change, or modifier change the customer requests. The backend is the
+        authority: it validates that the item exists and is available, that the
+        quantity is valid, that modifiers are allowed and options are valid, and
+        it computes unit_price and line_total (including modifier price deltas).
+        The agent must never calculate prices itself - always read the returned
+        subtotal. Error responses use {"error": {"code", "message", "details"}};
+        translate codes into plain speech for the customer (never read raw codes
+        aloud). Common codes: item_not_found (no such menu item - offer what the
+        menu actually has), item_unavailable, invalid_quantity, unknown_modifier,
+        invalid_modifier_option, missing_required_modifiers (ask the customer for
+        the listed options), ambiguous_item_reference (details.candidates lists
+        the matching order lines - ask the customer which one they mean),
+        line_not_found, order_locked.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, action, item_id]
+              properties:
+                session_id:
+                  type: string
+                  description: >
+                    The Dialogflow session id, passed through unchanged. It keys
+                    the customer's order for the whole call.
+                  example: projects/my-project/agent/sessions/abc123
+                action:
+                  type: string
+                  enum: [add, remove, update]
+                  description: >
+                    add: put a new line on the order (quantity defaults to 1).
+                    remove: delete matching order line(s) for item_id entirely.
+                    update: change quantity and/or modifiers of the existing line
+                    for item_id.
+                  example: add
+                item_id:
+                  type: string
+                  description: >
+                    Exact item id from get_menu/search_menu (never a spoken name).
+                    For ambiguous spoken references, resolve to an id using
+                    conversation context and get_order first; if two lines could
+                    match, ask the customer which one instead of guessing.
+                  example: general-tsos-chicken
+                quantity:
+                  type: integer
+                  minimum: 1
+                  description: >
+                    For add: how many (default 1). For update: the NEW total
+                    quantity (not a delta) - e.g. customer says "actually make
+                    that one egg roll" after ordering two => update quantity 1.
+                    For remove: how many to take off (omit to remove the whole line).
+                  example: 2
+                modifiers:
+                  type: object
+                  additionalProperties:
+                    type: string
+                  description: >
+                    For add: modifier name -> chosen option name, e.g.
+                    {"size": "regular", "spice_level": "spicy"}. Required
+                    modifiers MUST be included; optional ones may be omitted
+                    (defaults apply). IMPORTANT inheritance rule: if modifiers
+                    are omitted on add and exactly ONE order line already exists
+                    for this item_id, the new line inherits that line's
+                    modifiers. If none or more than one exist and required
+                    modifiers are missing, the backend returns
+                    missing_required_modifiers - ask the customer for the options.
+                  example: {size: regular, spice_level: spicy}
+                set_modifiers:
+                  type: object
+                  additionalProperties:
+                    type: string
+                  description: >
+                    For update only: modifier overrides merged over the line's
+                    current modifiers. You may pass just the changed modifier
+                    (e.g. {"spice_level": "spicy"}) - unchanged modifiers such
+                    as a required size are preserved automatically.
+                  example: {spice_level: spicy}
+      responses:
+        '200':
+          description: Updated order summary (also returned for validation errors inside error field per backend contract)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session_id, state, currency, items, item_count, subtotal]
+                properties:
+                  session_id:
+                    type: string
+                  state:
+                    type: string
+                    enum: [draft, submitted]
+                  currency:
+                    type: string
+                    example: USD
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [item_id, name, quantity, modifiers, unit_price, line_total]
+                      properties:
+                        item_id:
+                          type: string
+                          example: egg-rolls
+                        name:
+                          type: string
+                          example: Egg Rolls
+                        quantity:
+                          type: integer
+                          example: 2
+                        modifiers:
+                          type: object
+                          additionalProperties:
+                            type: string
+                          description: Resolved modifier name -> option name.
+                          example: {protein: chicken}
+                        unit_price:
+                          type: number
+                          format: float
+                          description: Backend-calculated price per unit including modifier deltas.
+                          example: 12.49
+                        line_total:
+                          type: number
+                          format: float
+                          description: unit_price * quantity, calculated by the backend.
+                          example: 24.98
+                  item_count:
+                    type: integer
+                    description: Total number of units across all lines.
+                    example: 3
+                  subtotal:
+                    type: number
+                    format: float
+                    description: Backend-calculated order total in USD. Quote THIS number to the customer.
+                    example: 28.48
+                  confirmation_number:
+                    type: string
+                    nullable: true
+                    description: Null until submit_order succeeds.
+                    example: GW-1042
+        '404':
+          description: Not found (item_not_found, line_not_found)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: object
+                    required: [code, message]
+                    properties:
+                      code:
+                        type: string
+                        example: item_not_found
+                      message:
+                        type: string
+                      details:
+                        type: object
+        '409':
+          description: Conflict (ambiguous_item_reference with details.candidates listing the matching order lines - ask the customer which one they mean; order_locked when mutating an already-submitted order; item_unavailable)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: object
+                    required: [code, message]
+                    properties:
+                      code:
+                        type: string
+                        example: ambiguous_item_reference
+                      message:
+                        type: string
+                      details:
+                        type: object
+                        description: >
+                          Extra context, e.g. candidates: [{modifiers, quantity}]
+                          for ambiguous_item_reference.
+        '422':
+          description: Semantic validation error (invalid_quantity, unknown_modifier, invalid_modifier_option, missing_required_modifiers, empty_order, nothing_to_update)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: object
+                    required: [code, message]
+                    properties:
+                      code:
+                        type: string
+                        example: missing_required_modifiers
+                      message:
+                        type: string
+                        example: "Missing required modifier(s): size."
+                      details:
+                        type: object
+                        description: >
+                          Extra context, e.g. required_modifiers with real
+                          option names for missing_required_modifiers - use them
+                          to ask the customer.
+                        example: {required_modifiers: [{name: size, options: [regular, large]}]}
