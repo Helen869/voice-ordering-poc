@@ -1,0 +1,118 @@
+openapi: 3.0.3
+info:
+  title: Golden Wok - Submit Order Tool
+  version: 1.0.0
+  description: >
+    Tool spec for the Golden Wok restaurant voice-ordering POC.
+    Finalizes the order. CALL ONLY AFTER EXPLICIT CUSTOMER CONFIRMATION.
+servers:
+  - url: https://YOUR-CLOUD-RUN-URL
+    description: Cloud Run FastAPI backend (fill in during setup)
+paths:
+  /tools/order/submit:
+    post:
+      operationId: submit_order
+      summary: Submit the order for preparation
+      description: >
+        WARNING: Call this ONLY after the customer has explicitly confirmed
+        ("Yes, place the order", "Yes, that's right", or equivalent). Never call
+        it after a vague "that's all" or "okay" - those mean "read the summary
+        back to me", not "submit". The flow is: get_order -> read back a concise
+        summary (items, quantities, key modifiers, subtotal) -> ask "Would you
+        like me to place the order?" -> on explicit yes, call submit_order. If
+        the customer changes anything during confirmation, update the order with
+        update_order, re-fetch with get_order, re-read the summary, and ask for
+        confirmation again. Submitting an empty order returns 422 empty_order.
+        Calling submit twice is idempotent: the second call returns the same
+        summary with already_submitted: true. On success, read the
+        confirmation_number back to the customer.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id]
+              properties:
+                session_id:
+                  type: string
+                  description: The Dialogflow session id, passed through unchanged.
+                  example: projects/my-project/agent/sessions/abc123
+      responses:
+        '200':
+          description: Submitted order summary with confirmation number
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session_id, state, currency, items, item_count, subtotal, confirmation_number]
+                properties:
+                  session_id:
+                    type: string
+                  state:
+                    type: string
+                    enum: [submitted]
+                    example: submitted
+                  currency:
+                    type: string
+                    example: USD
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [item_id, name, quantity, modifiers, unit_price, line_total]
+                      properties:
+                        item_id:
+                          type: string
+                          example: general-tsos-chicken
+                        name:
+                          type: string
+                          example: General Tso's Chicken
+                        quantity:
+                          type: integer
+                          example: 1
+                        modifiers:
+                          type: object
+                          additionalProperties:
+                            type: string
+                          example: {size: large, spice_level: spicy}
+                        unit_price:
+                          type: number
+                          format: float
+                          example: 16.99
+                        line_total:
+                          type: number
+                          format: float
+                          example: 16.99
+                  item_count:
+                    type: integer
+                    example: 4
+                  subtotal:
+                    type: number
+                    format: float
+                    example: 35.46
+                  confirmation_number:
+                    type: string
+                    description: Order confirmation code to read back to the customer.
+                    example: GW-1042
+                  already_submitted:
+                    type: boolean
+                    description: True only when this session was already submitted (idempotent re-submit).
+                    example: false
+        '422':
+          description: Cannot submit an empty order
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: object
+                    required: [code, message]
+                    properties:
+                      code:
+                        type: string
+                        example: empty_order
+                      message:
+                        type: string
+                        example: Cannot submit an empty order.

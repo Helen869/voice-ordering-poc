@@ -1,0 +1,107 @@
+openapi: 3.0.3
+info:
+  title: Golden Wok - Get Menu Tool
+  version: 1.0.0
+  description: >
+    Tool spec for the Golden Wok restaurant voice-ordering POC.
+    Returns the full authoritative menu. The LLM must treat this response as the
+    ONLY source of truth for menu items, prices, sizes, modifiers, and availability.
+servers:
+  - url: https://YOUR-CLOUD-RUN-URL
+    description: Cloud Run FastAPI backend (fill in during setup)
+paths:
+  /tools/menu:
+    get:
+      operationId: get_menu
+      summary: Get the full restaurant menu
+      description: >
+        Retrieves the complete Golden Wok menu: every item with its id, name,
+        description, category, base_price, required/optional modifiers, and
+        availability. Call this when the customer asks what is available, asks
+        for recommendations, or when you need to check whether an item, size, or
+        modifier exists before quoting it. NEVER state a menu item, price, size,
+        modifier, or availability from memory or from the conversation - always
+        read it from this tool's response. Prices here are authoritative; the
+        agent must never calculate or invent prices.
+      responses:
+        '200':
+          description: Full menu
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [restaurant, currency, item_count, items]
+                properties:
+                  restaurant:
+                    type: string
+                    example: Golden Wok
+                  currency:
+                    type: string
+                    example: USD
+                  item_count:
+                    type: integer
+                    example: 19
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, name, description, category, base_price, available, modifiers]
+                      properties:
+                        id:
+                          type: string
+                          description: Stable item identifier. Always pass this exact id to update_order.
+                          example: general-tsos-chicken
+                        name:
+                          type: string
+                          example: General Tso's Chicken
+                        description:
+                          type: string
+                          example: Crispy chicken tossed in a sweet and tangy glaze.
+                        category:
+                          type: string
+                          example: Entrees
+                        base_price:
+                          type: number
+                          format: float
+                          description: Base price in USD before modifier price deltas.
+                          example: 13.99
+                        available:
+                          type: boolean
+                          description: If false, the item cannot be ordered right now.
+                          example: true
+                        modifiers:
+                          type: array
+                          description: >
+                            Modifier groups for this item. A modifier with required=true
+                            MUST be provided in update_order (ask the customer which
+                            option they want). A modifier with required=false has a
+                            default that applies automatically - do not ask about it
+                            unless the customer mentions it.
+                          items:
+                            type: object
+                            required: [name, required, options]
+                            properties:
+                              name:
+                                type: string
+                                example: size
+                              required:
+                                type: boolean
+                                example: true
+                              default:
+                                type: string
+                                description: Option applied automatically when required=false and the customer does not choose. Absent for required modifiers.
+                                example: medium
+                              options:
+                                type: array
+                                items:
+                                  type: object
+                                  required: [name, price_delta]
+                                  properties:
+                                    name:
+                                      type: string
+                                      example: large
+                                    price_delta:
+                                      type: number
+                                      format: float
+                                      description: Amount added to base_price when this option is chosen.
+                                      example: 3.00
