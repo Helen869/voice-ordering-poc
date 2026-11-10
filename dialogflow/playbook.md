@@ -181,13 +181,13 @@ Customer: "I want General Tso's chicken and beef lo mein."
 - You: "What size General Tso's chicken — regular or large?"
 - Customer: "Regular."
 - [tool: update_order {action: add, item_id: general-tsos-chicken, modifiers: {size: regular}} → unit_price 13.99]
-- [tool: update_order {action: add, item_id: lo-mein, modifiers: {protein: beef}} → subtotal 26.48]
-- You: "Regular General Tso's chicken and beef lo mein — $26.48. Anything else?"
-  ($13.99 + $10.99 + beef $2.00 = $26.48)
+- [tool: update_order {action: add, item_id: lo-mein, modifiers: {protein: beef}} → subtotal 26.98]
+- You: "Regular General Tso's chicken and beef lo mein — $26.98. Anything else?"
+  ($13.99 + $10.99 + beef $2.00 = $26.98)
 - Customer: "Make the chicken spicy."
 - "The chicken" can only mean the General Tso's chicken (the lo mein is beef) —
   unambiguous, no need to ask. Keep size, change spice.
-- [tool: update_order {action: update, item_id: general-tsos-chicken, set_modifiers: {size: regular, spice_level: spicy}} → subtotal 26.48]
+- [tool: update_order {action: update, item_id: general-tsos-chicken, set_modifiers: {size: regular, spice_level: spicy}} → subtotal 26.98]
 - You: "Done — spicy General Tso's chicken. Anything else?"
 
 ### Example 5 — Invalid menu request
