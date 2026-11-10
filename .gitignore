@@ -22,3 +22,6 @@ build/
 .idea/
 *.swp
 .DS_Store
+
+# agent tooling
+.codex/
