@@ -282,3 +282,45 @@ def test_end_to_end_against_real_backend():
     assert placed["state"] == "submitted" and placed["confirmation_number"]
     for result in (added, order, placed):
         assert "session_id" not in result
+
+
+# -- backend error mapping: explicit allowlist ------------------------------------
+def _backend_error_codes():
+    """Every code the backend's OrderServiceError subclasses can return."""
+    import app.order_service as svc
+
+    found, stack = set(), [svc.OrderServiceError]
+    while stack:
+        cls = stack.pop()
+        for sub in cls.__subclasses__():
+            stack.append(sub)
+            if isinstance(getattr(sub, "code", None), str):
+                found.add((sub.code, sub.http_status))
+    return sorted(found)
+
+
+def test_argument_error_allowlist_is_exactly_two_codes():
+    from live.bridge.tools import _BACKEND_ARGUMENT_ERRORS
+
+    assert _BACKEND_ARGUMENT_ERRORS == {"invalid_request", "missing_query"}
+
+
+@pytest.mark.parametrize("code", ["invalid_request", "missing_query"])
+def test_allowlisted_backend_codes_become_invalid_arguments(code):
+    body = {"error": {"code": code, "message": "bad request", "details": {}}}
+    be = FakeBackend({("POST", "/tools/order/update"): BackendResponse(422, body)})
+    result = run(router(be).call("update_order", {"action": "add", "item_id": "coke"}))
+    assert result["error"]["code"] == INVALID_ARGUMENTS
+
+
+def test_backend_error_codes_discovered():
+    codes = {c for c, _ in _backend_error_codes()}
+    assert {"item_not_found", "nothing_to_update", "order_locked", "empty_order"} <= codes
+
+
+@pytest.mark.parametrize("code,status", _backend_error_codes())
+def test_other_backend_error_codes_pass_through_unchanged(code, status):
+    body = {"error": {"code": code, "message": f"msg for {code}", "details": {"item_id": "coke"}}}
+    be = FakeBackend({("POST", "/tools/order/update"): BackendResponse(status, body)})
+    result = run(router(be).call("update_order", {"action": "update", "item_id": "coke"}))
+    assert result == body
