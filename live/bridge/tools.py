@@ -28,7 +28,7 @@ BACKEND_UNAVAILABLE = "backend_unavailable"
 
 # Backend codes meaning the request itself was malformed. Not in the spoken error
 # table, so the model gets them as invalid_arguments and fixes the call silently.
-_BACKEND_ARGUMENT_ERRORS = {"invalid_request", "missing_query"}
+_BACKEND_ARGUMENT_ERRORS = {"invalid_request", "missing_query", "nothing_to_update"}
 
 _MODIFIER_ARRAY_ARGS = ("modifiers", "set_modifiers")
 _NO_PARAMETERS = {"type": "object", "properties": {}}

@@ -299,13 +299,13 @@ def _backend_error_codes():
     return sorted(found)
 
 
-def test_argument_error_allowlist_is_exactly_two_codes():
+def test_argument_error_allowlist_is_exactly_three_codes():
     from live.bridge.tools import _BACKEND_ARGUMENT_ERRORS
 
-    assert _BACKEND_ARGUMENT_ERRORS == {"invalid_request", "missing_query"}
+    assert _BACKEND_ARGUMENT_ERRORS == {"invalid_request", "missing_query", "nothing_to_update"}
 
 
-@pytest.mark.parametrize("code", ["invalid_request", "missing_query"])
+@pytest.mark.parametrize("code", ["invalid_request", "missing_query", "nothing_to_update"])
 def test_allowlisted_backend_codes_become_invalid_arguments(code):
     body = {"error": {"code": code, "message": "bad request", "details": {}}}
     be = FakeBackend({("POST", "/tools/order/update"): BackendResponse(422, body)})
@@ -318,9 +318,28 @@ def test_backend_error_codes_discovered():
     assert {"item_not_found", "nothing_to_update", "order_locked", "empty_order"} <= codes
 
 
-@pytest.mark.parametrize("code,status", _backend_error_codes())
+@pytest.mark.parametrize("code,status", [
+    (c, s) for c, s in _backend_error_codes() if c != "nothing_to_update"
+])
 def test_other_backend_error_codes_pass_through_unchanged(code, status):
     body = {"error": {"code": code, "message": f"msg for {code}", "details": {"item_id": "coke"}}}
     be = FakeBackend({("POST", "/tools/order/update"): BackendResponse(status, body)})
     result = run(router(be).call("update_order", {"action": "update", "item_id": "coke"}))
     assert result == body
+
+
+def test_nothing_to_update_from_real_backend_becomes_invalid_arguments():
+    async def go():
+        be = HttpBackend("http://backend", transport=httpx.ASGITransport(app=app))
+        r = ToolRouter(be, "live-ntu-" + str(id(be)))
+        try:
+            await r.call("update_order", {"action": "add", "item_id": "coke"})
+            return await r.call("update_order", {
+                "action": "update", "item_id": "coke", "set_modifiers": [],
+            })
+        finally:
+            await be.aclose()
+
+    result = run(go())
+    assert result["error"]["code"] == INVALID_ARGUMENTS
+    assert "Fix and retry" in result["error"]["message"]
