@@ -45,11 +45,12 @@ def load_system_instruction(path: Path = SYSTEM_INSTRUCTION_PATH) -> str:
     return "\n".join(lines[start:]).strip()
 
 
-def build_live_config(resumption_handle: Optional[str]) -> dict:
+def build_live_config(resumption_handle: Optional[str], extra: Optional[dict] = None) -> dict:
     return {
         "response_modalities": ["AUDIO"],
         "system_instruction": load_system_instruction(),
         "tools": [{"function_declarations": list(load_declarations().values())}],
+        **(extra or {}),
         "session_resumption": {"handle": resumption_handle},
     }
 
@@ -102,6 +103,7 @@ class CallBridge:
                 self._calls.put_nowait(fc)
         if getattr(msg, "tool_call_cancellation", None):
             ids = msg.tool_call_cancellation.ids or []
+            logger.info("tool calls cancelled by server: %s", ids)
             self._cancelled.update(ids)
             for call_id in ids:
                 # Response already sent but the server discarded it: re-tell via note.
@@ -110,6 +112,10 @@ class CallBridge:
             await self._maybe_flush_notes()
         content = getattr(msg, "server_content", None)
         if content:
+            for attr, who in (("input_transcription", "caller"), ("output_transcription", "agent")):
+                tr = getattr(content, attr, None)
+                if tr and getattr(tr, "text", None):
+                    logger.info("[%s] %s", who, tr.text)
             if content.model_turn:
                 self._model_idle = False
             if content.turn_complete or content.interrupted:
@@ -131,9 +137,13 @@ class CallBridge:
         if fc.id in self._cancelled:
             logger.info("skipping cancelled call %s (%s)", fc.id, fc.name)
             return
-        result = await self.router.call(fc.name, dict(fc.args or {}))
+        args = dict(fc.args or {})
+        result = await self.router.call(fc.name, args)
+        outcome = result["error"]["code"] if "error" in result else "ok"
+        logger.info("tool %s(%s) -> %s", fc.name, args, outcome)
         submitted = fc.name == "submit_order" and is_successful_submit(result)
         if fc.id in self._cancelled:
+            logger.info("not responding to cancelled call %s (%s)", fc.id, fc.name)
             if submitted:
                 self._queue_note(result["confirmation_number"])
                 await self._maybe_flush_notes()
@@ -156,17 +166,21 @@ class CallBridge:
         while self._notes:
             # Realtime text, not send_client_content: the SDK warns against
             # interleaving client_content with realtime audio input.
-            await self._session.send_realtime_input(text=self._notes.pop(0))
+            note = self._notes.pop(0)
+            logger.info("sending %r", note)
+            await self._session.send_realtime_input(text=note)
 
     # -- connection loop ----------------------------------------------------
-    async def run(self, client: Any, model: str, audio: AudioPort) -> None:
+    async def run(
+        self, client: Any, model: str, audio: AudioPort, extra_config: Optional[dict] = None
+    ) -> None:
         """Bridge until the call ends, resuming the Live session on go_away/drops."""
         worker = asyncio.create_task(self.run_tools())
         failures = 0
         try:
             while True:
                 try:
-                    config = build_live_config(self.resumption_handle)
+                    config = build_live_config(self.resumption_handle, extra_config)
                     async with client.aio.live.connect(model=model, config=config) as session:
                         self.attach(session)
                         failures = 0
