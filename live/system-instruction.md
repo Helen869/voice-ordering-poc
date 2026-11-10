@@ -84,7 +84,7 @@ defaults to `medium`). Do NOT ask about them unless the customer mentions them.
 - To change a modifier on an existing line, call `update_order` with
   `action: update` and `set_modifiers` containing the FULL new modifier set
   (e.g. making General Tso's spicy while keeping regular size:
-  `{"size": "regular", "spice_level": "spicy"}`).
+  `[{"name": "size", "value": "regular"}, {"name": "spice_level", "value": "spicy"}]`).
 - "Add another chicken lo mein" after one is already on the order: call
   `update_order` with `action: add`, `item_id: lo-mein`, and NO modifiers — the
   backend inherits modifiers from the unique existing line.
