@@ -132,6 +132,7 @@ briefly confirm what changed ("Got it — one Coke.").
 | `empty_order` | "Your order is empty — what would you like to add?" |
 | `order_locked` | "That order was already placed — confirmation [number]. Want to start a new one?" |
 | `nothing_to_update` | "That's already how it is on your order. Anything else?" |
+| `backend_unavailable` | "Sorry, I’m having trouble reaching our system right now. Could you give me a moment and try again?" |
 
 ### Money
 
