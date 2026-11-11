@@ -148,6 +148,9 @@ async def _read_loop(session: Any, bridge: CallBridge, state: TurnState, events:
                     log.add("tool_call_cancellation", state.step, ids=list(msg.tool_call_cancellation.ids or []))
                 if sc and (sc.turn_complete or sc.interrupted):
                     log.add("turn_complete" if sc.turn_complete else "interrupted", state.step)
+                if getattr(msg, "usage_metadata", None):  # token usage, for cost estimates
+                    log.add("usage", state.step,
+                            usage=msg.usage_metadata.model_dump(exclude_none=True, mode="json"))
                 await bridge.on_message(msg)
                 if sc and sc.turn_complete:
                     events.put_nowait("turn_complete")
