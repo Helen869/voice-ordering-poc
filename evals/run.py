@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -33,7 +34,7 @@ import yaml
 from dotenv import load_dotenv
 
 from app.main import app, order_service
-from evals.checks import evaluate
+from evals.checks import evaluate, run_passed
 from live.bridge.call import (
     DEFAULT_LANGUAGE,
     LIVE_API_VERSION,
@@ -187,8 +188,17 @@ async def _wait_turn_done(events: asyncio.Queue, bridge: CallBridge, timeout: fl
         completed = event == "turn_complete"
 
 
+MAX_REASK_REPLIES = 2
+_ASKS_TO_PLACE = re.compile(r"\bplace\b[^?.!]*\border\b[^?.!]*\?", re.IGNORECASE)
+
+
+def asks_to_place_order(agent_text: str) -> bool:
+    """'Would you like me to place the order?' and similar."""
+    return bool(_ASKS_TO_PLACE.search(agent_text))
+
+
 async def run_case(client: Any, case: dict, args: argparse.Namespace) -> dict:
-    steps = case["steps"]
+    steps = [dict(s) for s in case["steps"]]  # may grow with re-ask replies
     session_id = f"eval-{case['id']}-{uuid.uuid4().hex[:8]}"
     http = HttpBackend("http://backend", transport=httpx.ASGITransport(app=app), timeout=10)
     backend = SwitchableBackend(http)
@@ -229,6 +239,23 @@ async def run_case(client: Any, case: dict, args: argparse.Namespace) -> dict:
                     except asyncio.TimeoutError:
                         raise RuntimeError(f"timeout waiting for the agent at step {i + 1}") from None
                     i += 1
+                # Conditional caller reply: the agent asks again whether to
+                # place the order (e.g. after the bridge refused a submit).
+                reply = case.get("reask_reply")
+                replies = 0
+                while (reply and replies < MAX_REASK_REPLIES
+                       and asks_to_place_order(state.agent[-1])
+                       and not any(c["name"] == "submit_order" and "error" not in c["result"]
+                                   for c in recorder.calls)):
+                    replies += 1
+                    steps.append({"say": reply, "explicit_yes": True, "auto_reply": True})
+                    state.agent.append("")
+                    begin(len(steps) - 1)
+                    await session.send_realtime_input(text=reply)
+                    try:
+                        await _wait_turn_done(events, bridge, args.step_timeout, args.settle)
+                    except asyncio.TimeoutError:
+                        raise RuntimeError(f"timeout waiting for the agent at re-ask reply {replies}") from None
             finally:
                 cancelled = bool(getattr(bridge, "_cancelled", None))
                 for task in (reader, worker):
@@ -245,6 +272,7 @@ async def run_case(client: Any, case: dict, args: argparse.Namespace) -> dict:
         "session_id": session_id,
         "steps": [
             {"say": spec["say"], "explicit_yes": bool(spec.get("explicit_yes")),
+             "auto_reply": bool(spec.get("auto_reply")),
              "agent": state.agent[i],
              "calls": [{k: c[k] for k in ("name", "args", "result")} for c in recorder.calls if c["step"] == i]}
             for i, spec in enumerate(steps)
@@ -256,7 +284,7 @@ async def run_case(client: Any, case: dict, args: argparse.Namespace) -> dict:
         "error": error,
     }
     run["checks"] = evaluate(case, run)
-    run["passed"] = all(c["passed"] for c in run["checks"].values())
+    run["passed"] = run_passed(run["checks"])
     return run
 
 
@@ -292,7 +320,10 @@ def summarize(cases: list[dict], results: dict[str, list[dict]]) -> tuple[dict, 
         case_checks: dict[str, list[int]] = defaultdict(lambda: [0, 0])
         for run in runs:
             for name, res in run["checks"].items():
-                for bucket in (case_checks[name], per_check[name]):
+                buckets = [per_check[name]]
+                if res.get("counted", True):
+                    buckets.append(case_checks[name])
+                for bucket in buckets:
                     bucket[0] += res["passed"]
                     bucket[1] += 1
         per_case[case["id"]] = {
@@ -318,15 +349,22 @@ def print_report(meta: dict, per_case: dict, per_check: dict, results: dict, thr
         flag = "" if s["pass_rate"] >= threshold else "  <-- below threshold"
         print(f"{cid:<{width}}  {s['passed_runs']}/{s['runs']}  {s['pass_rate']:>5.0%}   "
               f"{', '.join(failing) or '-'}{flag}")
-    print(f"\n{'check':<32} pass rate")
+    print(f"\n{'check (all runs, counted or not)':<32} pass rate")
     for name, s in per_check.items():
         print(f"{name:<32} {s['passed']}/{s['applicable']}  {s['rate']:.0%}")
     failures = [(cid, n, run) for cid, runs in results.items() for n, run in enumerate(runs, 1) if not run["passed"]]
     if failures:
         print("\nfailures:")
         for cid, n, run in failures:
-            bad = "; ".join(f"{k}: {v['detail']}" for k, v in run["checks"].items() if not v["passed"])
+            bad = "; ".join(f"{k}: {v['detail']}" for k, v in run["checks"].items()
+                            if not v["passed"] and v.get("counted", True))
             print(f"  {cid} run {n}: {bad}")
+    info = [(cid, n, k, v["detail"]) for cid, runs in results.items() for n, run in enumerate(runs, 1)
+            for k, v in run["checks"].items() if not v["passed"] and not v.get("counted", True)]
+    if info:
+        print("\nnot counted for these cases (only_checks), for information:")
+        for cid, n, k, detail in info:
+            print(f"  {cid} run {n}: {k}: {detail}")
 
 
 # ---------------------------------------------------------------------------

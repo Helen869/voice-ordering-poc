@@ -148,11 +148,15 @@ def test_final_order_and_spoken_confirmation():
     case = {"final": {"state": "submitted", "subtotal": 2.99, "items": [{"item_id": "coke", "quantity": 1}]}}
     final = {"state": "submitted", "subtotal": 2.99, "confirmation_number": "GW-1042",
              "items": [{"item_id": "coke", "quantity": 1, "modifiers": {"size": "regular"}}]}
-    assert check_final_order(case, run_of(step(agent="Your confirmation number is G W ten forty-two."),
-                                          final=final))[0]
-    assert check_final_order(case, run_of(step(agent="Confirmation GW-1042."), final=final))[0]
-    passed, detail = check_final_order(case, run_of(step(agent="Order placed!"), final=final))
+    from evals.checks import check_confirmation_spoken
+
+    assert check_final_order(case, run_of(step(agent="Order placed!"), final=final))[0]
+    assert check_confirmation_spoken(case, run_of(
+        step(agent="Your confirmation number is G W ten forty-two."), final=final))[0]
+    assert check_confirmation_spoken(case, run_of(step(agent="Confirmation GW-1042."), final=final))[0]
+    passed, detail = check_confirmation_spoken(case, run_of(step(agent="Order placed!"), final=final))
     assert not passed and "never spoken" in detail
+    assert not check_final_order(case, run_of(step(), final={**final, "confirmation_number": None}))[0]
 
 
 def test_final_order_rejects_extra_items():
@@ -164,7 +168,7 @@ def test_final_order_rejects_extra_items():
 
 def test_evaluate_marks_errors_as_failed_runs():
     checks = evaluate({"steps": [{"say": "hi"}]}, run_of(step(), error="timeout at step 1"))
-    assert checks["completed"] == {"passed": False, "detail": "timeout at step 1"}
+    assert checks["completed"] == {"passed": False, "detail": "timeout at step 1", "counted": True}
 
 
 # -- cases.yaml stays consistent with the menu ----------------------------------------
@@ -302,3 +306,72 @@ def test_longer_made_up_number_is_reported_whole():
     r = ev_run(returned(), said("Your confirmation number is GW-12345."))
     passed, detail = check_confirmation_numbers({}, r)
     assert not passed and "spoke GW-12345" in detail
+
+
+# -- wrong numbers corrected, get_order before submit, only_checks ----------------------------
+from evals.checks import check_get_order_before_submit, check_wrong_number_corrected, run_passed
+
+
+def caller(text):
+    return {"type": "caller", "text": text}
+
+
+def test_wrong_number_corrected_in_same_agent_turn():
+    r = ev_run(caller("yes"), returned(), said("Your confirmation number is GW-1042. "),
+               said("Sorry, the confirmation number is GW-1045."))
+    assert check_wrong_number_corrected({}, r) == (True, "corrected: GW-1042")
+
+
+def test_wrong_number_corrected_only_after_next_caller_turn_fails():
+    r = ev_run(caller("yes"), returned(), said("Your confirmation number is GW-1042."),
+               caller("ok"), said("Correction: GW-1045."))
+    passed, detail = check_wrong_number_corrected({}, r)
+    assert not passed and "GW-1042" in detail
+
+
+def test_early_number_must_be_repeated_after_the_result():
+    early_then_ok = ev_run(caller("yes"), said("Your number is GW-1045. "), returned(),
+                           said("Your confirmation number is GW-1045."))
+    assert check_wrong_number_corrected({}, early_then_ok)[0]
+    early_only = ev_run(caller("yes"), said("Your number is GW-1045."), returned())
+    assert not check_wrong_number_corrected({}, early_only)[0]
+
+
+def test_wrong_number_check_not_applicable_when_all_correct():
+    assert check_wrong_number_corrected({}, ev_run(caller("yes"), returned(), said("GW-1045."))) is None
+
+
+def test_get_order_before_submit():
+    good = run_of(step(calls=[call("update_order"), call("get_order"), call("submit_order", result=SUBMIT_OK)]))
+    assert check_get_order_before_submit({}, good) == (True, "ok")
+    stale = run_of(step(calls=[call("get_order"), call("update_order"), call("submit_order", result=SUBMIT_OK)]))
+    assert not check_get_order_before_submit({}, stale)[0]
+    refused_then_ok = run_of(step(calls=[
+        call("update_order"),
+        call("submit_order", result={"error": {"code": "invalid_arguments", "message": "x"}}),
+        call("get_order"), call("submit_order", result=SUBMIT_OK)]))
+    assert check_get_order_before_submit({}, refused_then_ok) == (True, "ok (1 attempt(s) refused by the bridge)")
+
+
+def test_only_checks_decide_pass_but_others_are_still_reported():
+    case = {"steps": [{"say": "x"}], "only_checks": ["completed"]}
+    checks = evaluate(case, run_of(step(agent="backend unavailable")))
+    assert checks["no_leaks"] == {"passed": False, "detail": "spoke: backend_unavailable", "counted": False}
+    assert run_passed(checks)
+
+
+def test_cases_only_checks_name_real_checks():
+    from evals.checks import CHECKS
+
+    for case in _cases():
+        assert set(case.get("only_checks", [])) <= set(CHECKS), case["id"]
+
+
+def test_asks_to_place_order():
+    pytest.importorskip("yaml")
+    from evals.run import asks_to_place_order
+
+    assert asks_to_place_order("To confirm: one Coke, $2.99. Would you like me to place the order?")
+    assert asks_to_place_order("Shall I go ahead and place your order?")
+    assert not asks_to_place_order("Order placed! Your confirmation number is GW-1046.")
+    assert not asks_to_place_order("Anything else?")

@@ -23,6 +23,8 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from live.bridge.call import SPOKEN_CONFIRMATION
+
 MENU_PATH = Path(__file__).resolve().parent.parent / "data" / "menu.json"
 
 # Price fields a spoken amount may be quoted from, verbatim (never a computed sum).
@@ -336,23 +338,23 @@ def check_final_order(case: dict, run: dict) -> CheckResult:
             else:
                 actual.remove(match)
         problems += [f"unexpected {a['item_id']} x{a['quantity']} {a['modifiers']}" for a in actual]
-    if exp.get("state") == "submitted":
-        number = order.get("confirmation_number") or ""
-        spoken = _norm(" ".join(step["agent"] for step in run["steps"]))
-        if not number:
-            problems.append("no confirmation number")
-        elif not any(form in spoken for form in _confirmation_forms(number)):
-            problems.append(f"confirmation {number} never spoken")
+    if exp.get("state") == "submitted" and not order.get("confirmation_number"):
+        problems.append("no confirmation number")
     return (not problems), ("ok" if not problems else "; ".join(problems))
 
 
-# "GW-1045", "GW 1045", "G W 1 0 4 5", "confirmation number is 1045";
-# captures the whole number (a made-up "GW-12345" must not read as GW-1234).
-_SPOKEN_CONFIRMATION = re.compile(
-    r"\bG\s*\.?\s*-?\s*W\b\s*\.?\s*[-#:]?\s*((?:\d[\s-]?){3,}\d)(?!\d)"
-    r"|confirmation number(?: is)?\s*:?\s*((?:\d[\s-]?){3,}\d)(?!\d)",
-    re.IGNORECASE,
-)
+def check_confirmation_spoken(case: dict, run: dict) -> CheckResult:
+    """A submitted order's confirmation number was read to the caller."""
+    number = (run.get("final_order") or {}).get("confirmation_number")
+    if not number:
+        return None
+    spoken = _norm(" ".join(step["agent"] for step in run["steps"]))
+    if any(form in spoken for form in _confirmation_forms(number)):
+        return True, "ok"
+    return False, f"confirmation {number} never spoken"
+
+
+_SPOKEN_CONFIRMATION = SPOKEN_CONFIRMATION  # one definition, shared with the bridge guard
 
 
 def _successful_submits(run: dict) -> list[dict]:
@@ -396,6 +398,72 @@ def check_confirmation_numbers(case: dict, run: dict) -> CheckResult:
                             else "; ".join(problems))
 
 
+def _agent_mentions(run: dict) -> tuple[list[tuple[str, int, int]], dict[str, int]]:
+    """([(digits, seq, agent turn)], {returned digits: seq}). An agent turn is
+    the agent's speech between two caller turns."""
+    text, ends, returned, turn = "", [], {}, 0
+    for ev in run.get("events") or []:
+        if ev["type"] == "caller":
+            turn += 1
+            text += "\n"
+            ends.append((len(text), ev["seq"], turn))
+        elif ev["type"] == "agent_text":
+            text += ev["text"]
+            ends.append((len(text), ev["seq"], turn))
+        elif (ev["type"] == "tool_result" and ev.get("name") == "submit_order"
+              and "error" not in ev["result"] and ev["result"].get("confirmation_number")):
+            returned.setdefault(re.sub(r"\D", "", ev["result"]["confirmation_number"]), ev["seq"])
+    mentions = []
+    for m in SPOKEN_CONFIRMATION.finditer(text):
+        digits = re.sub(r"\D", "", m.group(1) or m.group(2))
+        seq, turn_of = next((s, t) for end, s, t in ends if end >= m.end())
+        mentions.append((digits, seq, turn_of))
+    return mentions, returned
+
+
+def check_wrong_number_corrected(case: dict, run: dict) -> CheckResult:
+    """Every wrong (or early) confirmation number is followed, in the same
+    agent turn, by the real one spoken after submit_order returned it."""
+    mentions, returned = _agent_mentions(run)
+    wrong = [(d, s, t) for d, s, t in mentions if d not in returned or s < returned[d]]
+    if not wrong:
+        return None
+    uncorrected = []
+    for digits, seq, turn in wrong:
+        fixed = any(d in returned and s > seq and s > returned[d] and t == turn for d, s, t in mentions)
+        if not fixed:
+            uncorrected.append(f"GW-{digits}")
+    if uncorrected:
+        return False, "not corrected in the same agent turn: " + ", ".join(uncorrected)
+    return True, "corrected: " + ", ".join(f"GW-{d}" for d, _, _ in wrong)
+
+
+def check_get_order_before_submit(case: dict, run: dict) -> CheckResult:
+    """Every submit_order that reached the backend came after a successful
+    get_order with no successful update_order in between (attempts the bridge
+    refused with invalid_arguments are counted in the detail only)."""
+    reviewed, executed, refused, bad = False, 0, 0, []
+    for index, call in _all_calls(run):
+        ok = "error" not in call["result"]
+        if call["name"] == "update_order" and ok:
+            reviewed = False
+        elif call["name"] == "get_order" and ok:
+            reviewed = True
+        elif call["name"] == "submit_order":
+            if call["result"].get("error", {}).get("code") == "invalid_arguments":
+                refused += 1
+                continue
+            executed += 1
+            if not reviewed:
+                bad.append(f"step {index + 1}")
+    if not executed and not refused:
+        return None
+    note = f" ({refused} attempt(s) refused by the bridge)" if refused else ""
+    if bad:
+        return False, "submit_order without a prior get_order at " + ", ".join(bad) + note
+    return True, f"ok{note}"
+
+
 def check_submit_at_most_once(case: dict, run: dict) -> CheckResult:
     """One successful submit_order per order (a repeat returns already_submitted)."""
     submits = _successful_submits(run)
@@ -419,16 +487,27 @@ CHECKS = {
     "speech": check_speech,
     "no_leaks": check_no_leaks,
     "final_order": check_final_order,
+    "confirmation_spoken": check_confirmation_spoken,
     "confirmation_numbers": check_confirmation_numbers,
+    "wrong_number_corrected": check_wrong_number_corrected,
     "submit_at_most_once": check_submit_at_most_once,
+    "get_order_before_submit": check_get_order_before_submit,
 }
 
 
 def evaluate(case: dict, run: dict) -> dict[str, dict]:
-    """Run every applicable check; {name: {"passed": bool, "detail": str}}."""
+    """Run every applicable check: {name: {"passed", "detail", "counted"}}.
+    A case's ``only_checks`` list decides which checks count toward passing;
+    the rest are still reported, as information."""
+    only = case.get("only_checks")
     out = {}
     for name, fn in CHECKS.items():
         result = fn(case, run)
         if result is not None:
-            out[name] = {"passed": result[0], "detail": result[1]}
+            out[name] = {"passed": result[0], "detail": result[1],
+                         "counted": only is None or name in only}
     return out
+
+
+def run_passed(checks: dict[str, dict]) -> bool:
+    return all(c["passed"] for c in checks.values() if c.get("counted", True))

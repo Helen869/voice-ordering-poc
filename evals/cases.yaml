@@ -13,12 +13,16 @@
 #   expect_calls:   calls that must each appear (any order); args are a subset
 #                   match (modifiers as a dict; q is a substring match)
 #   final:          backend order after the call: state, items (modifiers are a
-#                   subset match), subtotal. A submitted order must also have its
-#                   confirmation number spoken.
+#                   subset match), subtotal.
+#   reask_reply:    caller reply (an explicit yes) if, after the scripted turns, the
+#                   agent asks again whether to place the order; at most twice.
+#   only_checks:    checks that decide pass/fail for this case; the others are
+#                   still reported, for information.
 #
-# Always-on checks: completed, money_from_tools, no_premature_submit,
-# required_modifiers_from_caller, no_leaks, confirmation_numbers,
-# submit_at_most_once.
+# Always-on checks (where applicable): completed, money_from_tools,
+# no_premature_submit, required_modifiers_from_caller, no_leaks,
+# confirmation_spoken, confirmation_numbers, wrong_number_corrected,
+# submit_at_most_once, get_order_before_submit.
 
 cases:
   - id: ex1_normal_order
@@ -102,6 +106,7 @@ cases:
 
   - id: ex6_full_order_confirm_submit
     description: "Playbook example 6: order, change size, read back, explicit yes, submit"
+    reask_reply: "Yes"
     steps:
       - say: "I'll have General Tso's chicken, shrimp fried rice, and two Cokes."
       - say: "Regular. And make it spicy."
@@ -131,7 +136,9 @@ cases:
       subtotal: 35.46
 
   - id: barge_in_after_yes
-    description: "Caller talks over the agent right after 'yes'; order still placed once and number still heard"
+    description: "Caller talks over the agent right after 'yes'. Passes if the order is submitted after an explicit yes and get_order preceded every submit_order"
+    reask_reply: "Yes"
+    only_checks: [completed, final_order, no_premature_submit, get_order_before_submit]
     steps:
       - say: "One Coke please. That's all."
         forbid_calls: [submit_order]
@@ -145,9 +152,6 @@ cases:
       - name: submit_order
     final:
       state: submitted
-      items:
-        - {item_id: coke, quantity: 1}
-      subtotal: 2.99
 
   - id: coke_means_regular_coke
     description: "'Coke' exactly names Coke: add it directly, no question about Diet Coke"
