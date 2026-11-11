@@ -431,3 +431,51 @@ def test_bridge_passes_language_to_config():
         return seen
 
     assert asyncio.run(go())[0]["speech_config"] == {"language_code": "en-AU"}
+
+
+# -- one tool response per toolCall message -------------------------------------------
+class CountingSession(FakeSession):
+    def __init__(self):
+        super().__init__()
+        self.batches = []
+
+    async def send_tool_response(self, *, function_responses):
+        self.batches.append([r["id"] for r in function_responses])
+        await super().send_tool_response(function_responses=function_responses)
+
+
+def test_multi_call_message_gets_one_tool_response_in_order():
+    async def go():
+        session = CountingSession()
+        bridge = CallBridge(FakeRouter(result={"subtotal": 1}))
+        bridge.attach(session)
+        worker = asyncio.create_task(bridge.run_tools())
+        await bridge.on_message(tool_call(("a", "update_order", {}), ("b", "update_order", {}),
+                                          ("c", "update_order", {})))
+        assert not bridge.tools_idle
+        await drain(bridge)
+        worker.cancel()
+        return session, bridge
+
+    session, bridge = asyncio.run(go())
+    assert session.batches == [["a", "b", "c"]]  # not [["a"], ["b"], ["c"]]
+    assert bridge.tools_idle
+
+
+def test_call_cancelled_mid_batch_is_left_out_of_the_response():
+    async def go():
+        gate = asyncio.Event()
+        session = CountingSession()
+        router = FakeRouter(result={"subtotal": 1}, gate=gate)
+        bridge = CallBridge(router)
+        bridge.attach(session)
+        worker = asyncio.create_task(bridge.run_tools())
+        await bridge.on_message(tool_call(("a", "get_order", {}), ("b", "update_order", {})))
+        await asyncio.sleep(0)  # "a" in flight
+        await bridge.on_message(cancel("a"))
+        gate.set()
+        await drain(bridge)
+        worker.cancel()
+        return session
+
+    assert asyncio.run(go()).batches == [["b"]]

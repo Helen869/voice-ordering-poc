@@ -183,6 +183,12 @@ class CallBridge:
         self._noted: set[str] = set()  # confirmation numbers already noted
         self._model_idle = True
         self.stats: Optional[PumpStats] = None  # set by --debug
+        self._pending_tools = 0  # queued or running function calls
+
+    @property
+    def tools_idle(self) -> bool:
+        """True when no function call is queued or running."""
+        return self._pending_tools == 0
 
     @property
     def session_id(self) -> str:
@@ -198,8 +204,10 @@ class CallBridge:
             if upd.resumable and upd.new_handle:
                 self.resumption_handle = upd.new_handle
         if getattr(msg, "tool_call", None):
-            for fc in msg.tool_call.function_calls or []:
-                self._calls.put_nowait(fc)
+            batch = list(msg.tool_call.function_calls or [])
+            if batch:  # one message = one batch = one tool response
+                self._pending_tools += len(batch)
+                self._calls.put_nowait(batch)
         if getattr(msg, "tool_call_cancellation", None):
             ids = msg.tool_call_cancellation.ids or []
             logger.info("tool calls cancelled by server: %s", ids)
@@ -224,34 +232,43 @@ class CallBridge:
     # -- tool execution (one at a time, in order) ---------------------------
     async def run_tools(self) -> None:
         while True:
-            fc = await self._calls.get()
+            batch = await self._calls.get()
             try:
-                await self._execute(fc)
-            except Exception:  # never let one call kill the worker
-                logger.exception("tool call %s failed", getattr(fc, "name", "?"))
+                await self._execute_batch(batch)
+            except Exception:  # never let one batch kill the worker
+                logger.exception("tool batch %s failed", [getattr(fc, "name", "?") for fc in batch])
             finally:
+                self._pending_tools -= len(batch)
                 self._calls.task_done()
 
-    async def _execute(self, fc: Any) -> None:
-        if fc.id in self._cancelled:
-            logger.info("skipping cancelled call %s (%s)", fc.id, fc.name)
-            return
-        args = dict(fc.args or {})
-        result = await self.router.call(fc.name, args)
-        outcome = result["error"]["code"] if "error" in result else "ok"
-        logger.info("tool %s(%s) -> %s", fc.name, args, outcome)
-        submitted = fc.name == "submit_order" and is_successful_submit(result)
-        if fc.id in self._cancelled:
-            logger.info("not responding to cancelled call %s (%s)", fc.id, fc.name)
-            if submitted:
-                self._queue_note(result["confirmation_number"])
-                await self._maybe_flush_notes()
-            return
-        await self._session.send_tool_response(
-            function_responses=[{"id": fc.id, "name": fc.name, "response": result}]
-        )
-        if submitted:
-            self._sent_submits[fc.id] = result["confirmation_number"]
+    async def _execute_batch(self, batch: list) -> None:
+        """Run one toolCall message's calls in order, then answer them all in ONE
+        tool response. Answering call by call lets the model resume after the
+        first answer and re-issue the calls still pending (duplicate adds)."""
+        responses, submits = [], {}
+        for fc in batch:
+            if fc.id in self._cancelled:
+                logger.info("skipping cancelled call %s (%s)", fc.id, fc.name)
+                continue
+            args = dict(fc.args or {})
+            result = await self.router.call(fc.name, args)
+            outcome = result["error"]["code"] if "error" in result else "ok"
+            logger.info("tool %s(%s) -> %s", fc.name, args, outcome)
+            if fc.name == "submit_order" and is_successful_submit(result):
+                submits[fc.id] = result["confirmation_number"]
+            responses.append((fc, result))
+        live = []
+        for fc, result in responses:
+            if fc.id in self._cancelled:  # cancelled while the batch ran
+                logger.info("not responding to cancelled call %s (%s)", fc.id, fc.name)
+                if fc.id in submits:
+                    self._queue_note(submits.pop(fc.id))
+                continue
+            live.append({"id": fc.id, "name": fc.name, "response": result})
+        if live:
+            await self._session.send_tool_response(function_responses=live)
+        self._sent_submits.update(submits)
+        await self._maybe_flush_notes()
 
     # -- system notes -------------------------------------------------------
     def _queue_note(self, confirmation_number: str) -> None:
