@@ -37,6 +37,7 @@ from app.main import app, order_service
 from evals.checks import evaluate, run_passed
 from live.bridge.call import (
     DEFAULT_LANGUAGE,
+    load_system_instruction,
     LIVE_API_VERSION,
     CallBridge,
     build_live_config,
@@ -141,6 +142,12 @@ async def _read_loop(session: Any, bridge: CallBridge, state: TurnState, events:
                 if sc and sc.output_transcription and sc.output_transcription.text:
                     state.agent[state.step] += sc.output_transcription.text
                     log.add("agent_text", state.step, text=sc.output_transcription.text)
+                if sc and sc.model_turn:
+                    for part in sc.model_turn.parts or []:
+                        if part.inline_data and part.inline_data.data:  # 24 kHz 16-bit PCM
+                            log.add("audio", state.step, bytes=len(part.inline_data.data))
+                        if part.text:  # not speech: logged apart, never scored as speech
+                            log.add("model_text", state.step, text=part.text, thought=bool(part.thought))
                 if msg.tool_call:
                     fcs = msg.tool_call.function_calls or []
                     log.add("tool_call", state.step, ids=[f.id for f in fcs], names=[f.name for f in fcs])
@@ -198,6 +205,22 @@ async def _wait_turn_done(events: asyncio.Queue, bridge: CallBridge, timeout: fl
         completed = event == "turn_complete"
 
 
+OUTPUT_BYTES_PER_SECOND = 24_000 * 2  # Live audio output: 24 kHz, 16-bit mono PCM
+
+
+def step_audio_stats(events: list[dict], step: int) -> dict:
+    """Spoken audio, latency and non-speech text parts for one caller turn."""
+    said = next((e["t"] for e in events if e["type"] == "caller" and e["step"] == step), None)
+    audio = [e for e in events if e["type"] == "audio" and e["step"] == step]
+    parts = [e for e in events if e["type"] == "model_text" and e["step"] == step]
+    return {
+        "audio_seconds": round(sum(e["bytes"] for e in audio) / OUTPUT_BYTES_PER_SECOND, 2),
+        "first_audio_s": round(audio[0]["t"] - said, 2) if audio and said is not None else None,
+        "model_text_parts": len(parts),
+        "thought_parts": sum(1 for e in parts if e["thought"]),
+    }
+
+
 MAX_REASK_REPLIES = 2
 _ASKS_TO_PLACE = re.compile(r"\bplace\b[^?.!]*\border\b[^?.!]*\?", re.IGNORECASE)
 
@@ -218,6 +241,9 @@ async def run_case(client: Any, case: dict, args: argparse.Namespace) -> dict:
     state = TurnState(len(steps))
     events: asyncio.Queue = asyncio.Queue()
     config = build_live_config(None, {"output_audio_transcription": {}}, args.language or None)
+    if args.system_instruction:
+        config["system_instruction"] = load_system_instruction(Path(args.system_instruction))
+    config.update(args.live_config_dict)  # experiment arms, e.g. thinking_config
     error: Optional[str] = None
     cancelled = False
     started = time.monotonic()
@@ -284,6 +310,7 @@ async def run_case(client: Any, case: dict, args: argparse.Namespace) -> dict:
             {"say": spec["say"], "explicit_yes": bool(spec.get("explicit_yes")),
              "auto_reply": bool(spec.get("auto_reply")),
              "agent": state.agent[i],
+             **step_audio_stats(log.events, i),
              "calls": [{k: c[k] for k in ("name", "args", "result")} for c in recorder.calls if c["step"] == i]}
             for i, spec in enumerate(steps)
         ],
@@ -338,7 +365,11 @@ def summarize(cases: list[dict], results: dict[str, list[dict]]) -> tuple[dict, 
                 for bucket in buckets:
                     bucket[0] += res["passed"]
                     bucket[1] += 1
+        lat = sorted(s["first_audio_s"] for r in runs for s in r["steps"]
+                     if s.get("first_audio_s") is not None)
         per_case[case["id"]] = {
+            "first_audio_median_s": lat[len(lat) // 2] if lat else None,
+            "first_audio_p90_s": lat[min(len(lat) - 1, int(len(lat) * 0.9))] if lat else None,
             "pass_rate": sum(r["passed"] for r in runs) / len(runs),
             "passed_runs": sum(r["passed"] for r in runs),
             "runs": len(runs),
@@ -361,6 +392,11 @@ def print_report(meta: dict, per_case: dict, per_check: dict, results: dict, thr
         flag = "" if s["pass_rate"] >= threshold else "  <-- below threshold"
         print(f"{cid:<{width}}  {s['passed_runs']}/{s['runs']}  {s['pass_rate']:>5.0%}   "
               f"{', '.join(failing) or '-'}{flag}")
+    timed = {cid: s for cid, s in per_case.items() if s.get("first_audio_median_s") is not None}
+    if timed:
+        print(f"\n{'latency: caller turn -> first audio':<{width}}  median   p90")
+        for cid, s in timed.items():
+            print(f"{cid:<{width}}  {s['first_audio_median_s']:5.2f}s  {s['first_audio_p90_s']:5.2f}s")
     print(f"\n{'check (all runs, counted or not)':<32} pass rate")
     for name, s in per_check.items():
         print(f"{name:<32} {s['passed']}/{s['applicable']}  {s['rate']:.0%}")
@@ -459,6 +495,9 @@ async def main(args: argparse.Namespace) -> int:
         "started_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "model": args.model, "api_version": args.api_version, "language": args.language or "auto",
         "api_key_var": key_var, "api_key_suffix": key_suffix(api_key), "concurrency": args.concurrency,
+        "system_instruction": args.system_instruction or "live/system-instruction.md",
+        "system_instruction_blob": _git("hash-object", args.system_instruction) if args.system_instruction else None,
+        "live_config": args.live_config_dict,
         "google_genai": genai.__version__, "runs": args.runs, "threshold": args.threshold,
         "git": git_info(),
     }
@@ -530,7 +569,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--settle", type=float, default=2.0,
                    help="quiet seconds after a turn before the next caller turn")
     p.add_argument("--verbose", action="store_true", help="show bridge logs (tool calls etc.)")
+    p.add_argument("--system-instruction", metavar="PATH",
+                   help="use this prompt file instead of live/system-instruction.md (experiments)")
+    p.add_argument("--live-config", metavar="JSON", default="{}",
+                   help='extra Live config merged in, e.g. \'{"thinking_config": {"thinking_budget": 0}}\'')
     args = p.parse_args(argv)
+    try:
+        args.live_config_dict = json.loads(args.live_config)
+        assert isinstance(args.live_config_dict, dict)
+    except (ValueError, AssertionError):
+        p.error("--live-config must be a JSON object")
     if args.runs < 1 or args.concurrency < 1 or not 0 <= args.threshold <= 1:
         p.error("--runs and --concurrency must be >= 1, --threshold between 0 and 1")
     return args
