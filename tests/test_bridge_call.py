@@ -262,3 +262,144 @@ def test_live_client_uses_v1beta_by_default(monkeypatch):
     client = call_mod.make_live_client()
     assert LIVE_API_VERSION == "v1beta"
     assert client._api_client._http_options.api_version == "v1beta"
+
+
+# -- diagnostics and clean shutdown ---------------------------------------------------
+from array import array
+
+from live.bridge.call import PumpStats, message_kinds, pcm16_peak
+
+
+def pcm(*samples):
+    return array("h", samples).tobytes()
+
+
+def test_pcm16_peak():
+    assert pcm16_peak(pcm(0, 100, -2000, 5)) == 2000
+    assert pcm16_peak(b"") == 0
+
+
+def test_message_kinds():
+    m = msg(tool_call=NS(function_calls=[]), server_content=NS(
+        model_turn=NS(parts=[]), turn_complete=True, interrupted=False,
+        output_transcription=NS(text="hi")))
+    assert message_kinds(m) == ["tool_call", "model_turn", "turn_complete", "output_transcription"]
+    assert message_kinds(msg()) == ["<empty>"]
+
+
+def test_pump_stats_snapshot_resets():
+    s = PumpStats()
+    s.mic(pcm(10, -300))
+    s.model_audio(b"\x00" * 480)
+    s.message(content(turn_complete=True))
+    assert s.snapshot() == {"mic_chunks": 1, "mic_peak": 300, "model_chunks": 1,
+                            "model_bytes": 480, "kinds": {"turn_complete": 1}}
+    assert s.snapshot()["mic_chunks"] == 0
+
+
+class ScriptedSession(FakeSession):
+    """receive() yields ``script`` once, then blocks like an idle socket."""
+
+    def __init__(self, script=()):
+        super().__init__()
+        self.script = list(script)
+        self.audio_sent = []
+
+    async def send_realtime_input(self, *, audio=None, text=None, **_):
+        if audio is not None:
+            self.audio_sent.append(audio["data"])
+        if text is not None:
+            self.texts.append(text)
+
+    async def receive(self):
+        while self.script:
+            yield self.script.pop(0)
+        await asyncio.Event().wait()
+
+
+class ScriptedAudio:
+    def __init__(self, chunks=()):
+        self.chunks = list(chunks)
+        self.played = []
+
+    async def read(self):
+        if self.chunks:
+            return self.chunks.pop(0)
+        await asyncio.Event().wait()
+
+    async def play(self, data):
+        self.played.append(data)
+
+    async def clear(self):
+        pass
+
+
+class OkClient:
+    def __init__(self, session):
+        self.session = session
+        self.closed = False
+        client = self
+
+        class _Conn:
+            async def __aenter__(self):
+                return client.session
+
+            async def __aexit__(self, *a):
+                client.closed = True
+                return False
+
+        self.aio = NS(live=NS(connect=lambda **kw: _Conn()))
+
+
+def live_msg(audio=None, go_away=False):
+    parts = [NS(inline_data=NS(data=audio))] if audio else []
+    return NS(server_content=NS(model_turn=NS(parts=parts) if audio else None,
+                                turn_complete=False, interrupted=False),
+              tool_call=None, tool_call_cancellation=None, session_resumption_update=None,
+              go_away=NS(time_left="1s") if go_away else None)
+
+
+def test_pump_records_stats_and_plays_audio():
+    async def go():
+        session = ScriptedSession([live_msg(audio=b"\x01\x00" * 240), live_msg(go_away=True)])
+        audio = ScriptedAudio([pcm(0, 1234)])
+        bridge = CallBridge(FakeRouter())
+        bridge.stats = PumpStats()
+        ended = await bridge._pump(session, audio)
+        return ended, bridge.stats.snapshot(), session, audio
+
+    ended, snap, session, audio = asyncio.run(go())
+    assert ended is False  # go_away -> reconnect
+    assert snap["mic_chunks"] == 1 and snap["mic_peak"] == 1234
+    assert snap["model_chunks"] == 1 and snap["model_bytes"] == 480
+    assert snap["kinds"]["go_away"] == 1 and snap["kinds"]["model_turn"] == 1
+    assert audio.played == [b"\x01\x00" * 240]
+    assert session.audio_sent == [pcm(0, 1234)]
+
+
+def test_cancelling_run_awaits_every_task_and_closes_session():
+    async def go():
+        client = OkClient(ScriptedSession())
+        loop_errors = []
+        asyncio.get_running_loop().set_exception_handler(lambda l, c: loop_errors.append(c))
+        call = asyncio.create_task(CallBridge(FakeRouter()).run(client, "m", ScriptedAudio()))
+        await asyncio.sleep(0.05)  # upstream, downstream and tool worker all running
+        call.cancel()  # what Ctrl+C does to the main task
+        await asyncio.gather(call, return_exceptions=True)
+        leftover = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        return call, client, leftover, loop_errors
+
+    call, client, leftover, loop_errors = asyncio.run(go())
+    assert call.cancelled()
+    assert leftover == []
+    assert client.closed
+    assert loop_errors == []
+
+
+def test_harness_parse_device():
+    pytest.importorskip("sounddevice")
+    from live.bridge.local_harness import parse_device
+
+    assert parse_device(None) is None
+    assert parse_device("3") == 3
+    assert parse_device("Headset") == "Headset"

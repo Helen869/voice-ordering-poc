@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from array import array
+from collections import Counter
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
@@ -36,6 +38,66 @@ LIVE_API_VERSION = "v1beta"
 
 class LiveHandshakeError(RuntimeError):
     """The Live API rejected the WebSocket handshake with a 4xx (not retryable)."""
+
+
+_CONTENT_KINDS = (
+    "model_turn", "turn_complete", "interrupted", "generation_complete",
+    "input_transcription", "output_transcription", "waiting_for_input",
+)
+_MESSAGE_KINDS = (
+    "setup_complete", "tool_call", "tool_call_cancellation", "go_away",
+    "session_resumption_update", "usage_metadata", "voice_activity",
+    "voice_activity_detection_signal",
+)
+
+
+def message_kinds(msg: Any) -> list[str]:
+    """Names of the fields set on a LiveServerMessage, e.g. ['turn_complete']."""
+    kinds = [k for k in _MESSAGE_KINDS if getattr(msg, k, None)]
+    content = getattr(msg, "server_content", None)
+    if content:
+        kinds += [k for k in _CONTENT_KINDS if getattr(content, k, None)]
+    return kinds or ["<empty>"]
+
+
+def pcm16_peak(chunk: bytes) -> int:
+    samples = array("h")
+    samples.frombytes(chunk[: len(chunk) - len(chunk) % 2])
+    return max(max(samples), -min(samples)) if samples else 0
+
+
+class PumpStats:
+    """Counters for --debug diagnostics; read and reset once per second."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.mic_chunks = 0
+        self.mic_peak = 0
+        self.model_chunks = 0
+        self.model_bytes = 0
+        self.kinds: Counter[str] = Counter()
+
+    def mic(self, chunk: bytes) -> None:
+        self.mic_chunks += 1
+        self.mic_peak = max(self.mic_peak, pcm16_peak(chunk))
+
+    def model_audio(self, data: bytes) -> None:
+        self.model_chunks += 1
+        self.model_bytes += len(data)
+
+    def message(self, msg: Any) -> None:
+        self.kinds.update(message_kinds(msg))
+
+    def snapshot(self) -> dict:
+        snap = {
+            "mic_chunks": self.mic_chunks, "mic_peak": self.mic_peak,
+            "model_chunks": self.model_chunks, "model_bytes": self.model_bytes,
+            "kinds": dict(self.kinds),
+        }
+        self.reset()
+        return snap
 
 
 def new_session_id() -> str:
@@ -109,6 +171,7 @@ class CallBridge:
         self._notes: list[str] = []
         self._noted: set[str] = set()  # confirmation numbers already noted
         self._model_idle = True
+        self.stats: Optional[PumpStats] = None  # set by --debug
 
     @property
     def session_id(self) -> str:
@@ -229,36 +292,52 @@ class CallBridge:
                 else:
                     logger.info("reconnecting call %s (no resumption handle yet)", self.session_id)
         finally:
-            worker.cancel()
+            await _cancel_and_wait(worker)
 
     async def _pump(self, session: Any, audio: AudioPort) -> bool:
         """Run one Live session. True = call ended; False = reconnect needed."""
 
         async def upstream() -> None:
             while (chunk := await audio.read()) is not None:
+                if self.stats:
+                    self.stats.mic(chunk)
                 await session.send_realtime_input(
                     audio={"data": chunk, "mime_type": INPUT_AUDIO_MIME}
                 )
 
         async def downstream() -> None:
-            while True:  # receive() stops after each turn_complete
+            while True:  # receive() stops after each completed turn
                 async for msg in session.receive():
+                    if self.stats:
+                        self.stats.message(msg)
                     content = msg.server_content
                     if content and content.interrupted:
                         await audio.clear()
                     if content and content.model_turn:
                         for part in content.model_turn.parts or []:
                             if part.inline_data and part.inline_data.data:
+                                if self.stats:
+                                    self.stats.model_audio(part.inline_data.data)
                                 await audio.play(part.inline_data.data)
                     await self.on_message(msg)
                     if msg.go_away:
                         return
 
-        up = asyncio.create_task(upstream())
-        down = asyncio.create_task(downstream())
-        done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
+        up = asyncio.create_task(upstream(), name="live-upstream")
+        down = asyncio.create_task(downstream(), name="live-downstream")
+        try:
+            done, _ = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # Also runs on Ctrl+C (CancelledError): never leave a task unawaited.
+            await _cancel_and_wait(up, down)
         for task in done:
-            task.result()  # re-raise connection errors -> reconnect
+            if not task.cancelled():
+                task.result()  # re-raise connection errors -> reconnect
         return up in done
+
+
+async def _cancel_and_wait(*tasks: asyncio.Task) -> None:
+    """Cancel tasks and await them, swallowing their outcome (retrieved, not lost)."""
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
