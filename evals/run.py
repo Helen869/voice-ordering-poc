@@ -317,6 +317,8 @@ def summarize(cases: list[dict], results: dict[str, list[dict]]) -> tuple[dict, 
     per_check: dict[str, list[int]] = defaultdict(lambda: [0, 0])
     for case in cases:
         runs = results[case["id"]]
+        if not runs:  # every run hit an infrastructure error, or never started
+            continue
         case_checks: dict[str, list[int]] = defaultdict(lambda: [0, 0])
         for run in runs:
             for name, res in run["checks"].items():
@@ -342,7 +344,7 @@ def print_report(meta: dict, per_case: dict, per_check: dict, results: dict, thr
     print(f"prompt live/system-instruction.md  blob={prompt['blob'][:12]}  "
           f"last_commit={prompt['last_commit']}{'  (UNCOMMITTED CHANGES)' if prompt['uncommitted_changes'] else ''}"
           f"  HEAD={meta['git']['head']}\n")
-    width = max(len(c) for c in per_case)
+    width = max((len(c) for c in per_case), default=4)
     print(f"{'case':<{width}}  pass   rate   failing checks")
     for cid, s in per_case.items():
         failing = [f"{k} {v}" for k, v in s["checks"].items() if v.split("/")[0] != v.split("/")[1]]
@@ -385,6 +387,17 @@ def load_cases(path: Path, only: Optional[str]) -> list[dict]:
             raise ValueError(f"unknown case id(s): {', '.join(sorted(unknown))}")
         cases = [c for c in cases if c["id"] in wanted]
     return cases
+
+
+# Rate-limit / quota / billing failures are infrastructure errors, not agent
+# failures: such runs are not scored, and repeated ones stop the whole run.
+_QUOTA_ERROR = re.compile(
+    r"\b429\b|RESOURCE_EXHAUSTED|quota|rate.?limit|credits are depleted|billing", re.IGNORECASE)
+MAX_CONSECUTIVE_QUOTA_ERRORS = 2
+
+
+def is_quota_error(error: Optional[str]) -> bool:
+    return bool(error) and bool(_QUOTA_ERROR.search(error))
 
 
 # Evals use their own key when set (e.g. a separate free-tier key for synthetic data).
@@ -441,10 +454,23 @@ async def main(args: argparse.Namespace) -> int:
     }
     sem = asyncio.Semaphore(args.concurrency)
     results: dict[str, list[dict]] = {c["id"]: [] for c in cases}
+    infra: list[dict] = []  # runs lost to rate-limit / quota errors (not scored)
+    stop = {"streak": 0, "reason": None, "not_started": 0}
 
     async def one(case: dict, n: int) -> None:
         async with sem:
+            if stop["reason"]:
+                stop["not_started"] += 1
+                return
             run = await run_case(client, case, args)
+            if is_quota_error(run["error"]):
+                stop["streak"] += 1
+                infra.append({"case": case["id"], "run": n, "error": run["error"]})
+                print(f"  QUOTA {case['id']} run {n}/{args.runs}: {run['error'][:150]}", flush=True)
+                if stop["streak"] >= MAX_CONSECUTIVE_QUOTA_ERRORS:
+                    stop["reason"] = run["error"]
+                return
+            stop["streak"] = 0
             results[case["id"]].append(run)
             status = "PASS" if run["passed"] else "FAIL"
             print(f"  {status}  {case['id']} run {n}/{args.runs}  ({run['seconds']}s)", flush=True)
@@ -454,12 +480,22 @@ async def main(args: argparse.Namespace) -> int:
 
     per_case, per_check = summarize(cases, results)
     print_report(meta, per_case, per_check, results, args.threshold)
+    if infra:
+        print(f"\nnot scored, rate-limit/quota errors ({len(infra)}):")
+        for item in infra:
+            print(f"  {item['case']} run {item['run']}: {item['error'][:150]}")
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     out = REPORTS_DIR / f"report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
-    out.write_text(json.dumps({"meta": meta, "cases": per_case, "checks": per_check, "runs": results},
+    out.write_text(json.dumps({"meta": meta, "cases": per_case, "checks": per_check, "runs": results,
+                               "quota_errors": infra, "stopped": stop},
                               indent=2, default=str), encoding="utf-8")
-    print(f"\nreport: {out.relative_to(REPO_ROOT)}")
+    shown = out.relative_to(REPO_ROOT) if out.is_relative_to(REPO_ROOT) else out
+    print(f"\nreport: {shown}")
+    if stop["reason"]:
+        print(f"STOPPED: {MAX_CONSECUTIVE_QUOTA_ERRORS} rate-limit/quota errors in a row; "
+              f"{stop['not_started']} run(s) not started. Last error: {stop['reason'][:200]}")
+        return 2
     below = [cid for cid, s in per_case.items() if s["pass_rate"] < args.threshold]
     if below:
         print(f"FAILED: {len(below)} case(s) below {args.threshold:.0%}: {', '.join(below)}")

@@ -417,3 +417,59 @@ def test_concurrency_must_be_positive():
     assert parse_args([]).concurrency == 3
     with pytest.raises(SystemExit):
         parse_args(["--concurrency", "0"])
+
+
+# -- rate-limit / quota errors stop the run ------------------------------------------
+def test_is_quota_error():
+    pytest.importorskip("yaml")
+    from evals.run import is_quota_error
+
+    assert is_quota_error("handshake HTTP 429: <empty>")
+    assert is_quota_error("APIError: 1011 None. Your prepayment credits are depleted.")
+    assert is_quota_error("ClientError: 429 RESOURCE_EXHAUSTED. Quota exceeded")
+    assert not is_quota_error("RuntimeError: timeout waiting for the agent at step 2")
+    assert not is_quota_error(None)
+
+
+def _fake_main(monkeypatch, tmp_path, errors):
+    """Run evals.run.main with fake sessions; ``errors`` is consumed per run."""
+    pytest.importorskip("yaml")
+    import evals.run as er
+
+    calls = []
+
+    async def fake_run_case(client, case, args):
+        calls.append(case["id"])
+        error = errors.pop(0) if errors else None
+        run = {"error": error, "passed": error is None, "seconds": 0.0, "steps": [], "events": [],
+               "checks": {"completed": {"passed": error is None, "detail": error or "ok",
+                                        "counted": True, "warning": False}}}
+        return run
+
+    async def ok(*a, **k):
+        return None
+
+    monkeypatch.setattr(er, "run_case", fake_run_case)
+    monkeypatch.setattr(er, "preflight", ok)
+    monkeypatch.setattr(er, "make_live_client", lambda *a, **k: object())
+    monkeypatch.setattr(er, "REPORTS_DIR", tmp_path)
+    monkeypatch.setenv("GEMINI_EVAL_API_KEY", "fake-key-for-test-1234")
+    args = er.parse_args(["--cases", "ex1_normal_order,ex3_correction", "--runs", "3", "--concurrency", "1"])
+    code = asyncio.run(er.main(args))
+    return code, calls
+
+
+def test_two_quota_errors_in_a_row_stop_the_run(monkeypatch, tmp_path, capsys):
+    code, calls = _fake_main(monkeypatch, tmp_path, [None, "handshake HTTP 429: <empty>",
+                                                     "handshake HTTP 429: <empty>"])
+    assert code == 2
+    assert len(calls) == 3  # stopped: the other 3 of 6 runs never started
+    out = capsys.readouterr().out
+    assert "STOPPED: 2 rate-limit/quota errors in a row; 3 run(s) not started" in out
+
+
+def test_isolated_quota_error_is_not_scored(monkeypatch, tmp_path, capsys):
+    code, calls = _fake_main(monkeypatch, tmp_path, [None, "handshake HTTP 429: <empty>"])
+    assert len(calls) == 6 and code == 0  # one lost run; the other 5 passed
+    out = capsys.readouterr().out
+    assert "not scored, rate-limit/quota errors (1)" in out

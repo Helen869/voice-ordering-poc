@@ -21,8 +21,9 @@ These evals call the real API and cost money or quota. They are **not** part of
 > involved, including the production bridge and `local_harness.py` with real
 > callers.
 
-If you add a case, its caller lines must be invented, never copied from a real
-call.
+Cases may be inspired by real calls, but must be rewritten with no personal
+data (names, phone numbers, addresses, payment details). Raw call audio or
+transcripts never go into this repo or through a free-tier key.
 
 ## Setup
 
@@ -64,7 +65,13 @@ same, never the full key.
 
 Exit code: **0** means every case is at or above the threshold, **1** means
 some case is below it, and **2** means the runner could not start (no key,
-rejected handshake, or a bad cases file).
+rejected handshake, or a bad cases file) or stopped early.
+
+Rate-limit, quota and billing errors (HTTP 429, `RESOURCE_EXHAUSTED`,
+depleted credits) are not agent failures: such runs are left out of the pass
+rates and listed separately. **Two in a row stop the whole run**: no further
+sessions start, the report is still written, and the exit code is 2. Nothing
+is retried. Wait for the quota to reset, or lower `--concurrency`.
 
 ## Output
 
