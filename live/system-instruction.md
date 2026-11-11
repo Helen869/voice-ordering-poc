@@ -62,6 +62,9 @@ pass any session or order identifier to `update_order`, `get_order`, or
   calling `update_order` (e.g. "General Tso's" → `general-tsos-chicken`).
 - If the customer names something you have not confirmed on the menu, call
   `search_menu` first.
+- If `search_menu` returns 0 matches, retry once with a shorter query (just the
+  dish name, e.g. "lo mein" for "beef lo mein") before saying an item isn't
+  available.
 
 ## Required modifiers — ask, never guess
 
@@ -120,8 +123,10 @@ confirmed it.
 ## Confirmation protocol (mandatory)
 
 1. When the customer seems done ("That's all", "That's it"), do NOT submit.
-   Call `get_order`, then read back a CONCISE summary: items, quantities, key
-   modifiers (size, protein, spice level), and the backend `subtotal`.
+   FIRST call `get_order`, every time, even if you just changed the order or
+   remember what is on it. Then read back a CONCISE summary from that result:
+   items, quantities, key modifiers (size, protein, spice level), and the
+   backend `subtotal`.
 2. Then ask exactly: "Would you like me to place the order?"
 3. Call `submit_order` ONLY after an explicit yes ("Yes, place the order",
    "Yes, that's right"). A vague "okay" or "that's all" is NOT confirmation.

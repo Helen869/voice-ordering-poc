@@ -190,6 +190,9 @@ class ToolRouter:
         self._backend = backend
         self._session_id = session_id
         self._decls = declarations if declarations is not None else load_declarations()
+        # True after a successful update_order until a successful get_order:
+        # submit_order is refused until the order has been read back.
+        self._unreviewed_change = False
 
     @property
     def session_id(self) -> str:
@@ -215,11 +218,24 @@ class ToolRouter:
                 INVALID_ARGUMENTS, f"{name}: {exc}. Fix the arguments and call {name} again."
             )
 
+        if name == "submit_order" and self._unreviewed_change:
+            return error_result(
+                INVALID_ARGUMENTS,
+                "submit_order: the order changed since the last get_order. Call get_order "
+                "and read the order back to the caller first, then ask for confirmation.",
+            )
+
         try:
             resp = await getattr(self, f"_{name}")(clean)
         except BackendUnavailable:
             return _unavailable()
-        return self._to_model(resp)
+        result = self._to_model(resp)
+        if "error" not in result:
+            if name == "update_order":
+                self._unreviewed_change = True
+            elif name == "get_order":
+                self._unreviewed_change = False
+        return result
 
     # -- per-function handlers ---------------------------------------------
     async def _get_menu(self, args: dict) -> BackendResponse:

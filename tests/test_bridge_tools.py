@@ -343,3 +343,69 @@ def test_nothing_to_update_from_real_backend_becomes_invalid_arguments():
     result = run(go())
     assert result["error"]["code"] == INVALID_ARGUMENTS
     assert "Fix and retry" in result["error"]["message"]
+
+
+# -- submit_order guard: get_order must follow the last change ----------------------------
+SUBMITTED = BackendResponse(200, summary("submitted", confirmation_number="GW-1042"))
+
+
+def test_submit_refused_after_update_without_get_order():
+    be = FakeBackend({("POST", "/tools/order/submit"): SUBMITTED})
+    r = router(be)
+
+    async def go():
+        await r.call("update_order", {"action": "add", "item_id": "coke"})
+        return await r.call("submit_order", {})
+
+    result = run(go())
+    assert result["error"]["code"] == INVALID_ARGUMENTS
+    assert "call get_order and read the order back to the caller first" in result["error"]["message"].lower()
+    assert [q["path"] for q in be.requests] == ["/tools/order/update"]  # submit never sent
+
+
+def test_submit_allowed_after_get_order():
+    be = FakeBackend({("POST", "/tools/order/submit"): SUBMITTED})
+    r = router(be)
+
+    async def go():
+        await r.call("update_order", {"action": "add", "item_id": "coke"})
+        await r.call("get_order", {})
+        return await r.call("submit_order", {})
+
+    assert run(go())["confirmation_number"] == "GW-1042"
+
+
+def test_change_after_get_order_requires_another_get_order():
+    be = FakeBackend({("POST", "/tools/order/submit"): SUBMITTED})
+    r = router(be)
+
+    async def go():
+        await r.call("update_order", {"action": "add", "item_id": "coke"})
+        await r.call("get_order", {})
+        await r.call("update_order", {"action": "update", "item_id": "coke", "quantity": 2})
+        blocked = await r.call("submit_order", {})
+        await r.call("get_order", {})
+        return blocked, await r.call("submit_order", {})
+
+    blocked, placed = run(go())
+    assert blocked["error"]["code"] == INVALID_ARGUMENTS
+    assert placed["state"] == "submitted"
+
+
+def test_failed_update_or_failed_get_order_do_not_change_the_guard():
+    err = BackendResponse(404, {"error": {"code": "item_not_found", "message": "x"}})
+    be = FakeBackend({("POST", "/tools/order/update"): err, ("POST", "/tools/order/submit"): SUBMITTED})
+    r = router(be)
+    # A rejected update changes nothing, so submit is not blocked by it.
+    assert run(r.call("update_order", {"action": "add", "item_id": "pizza"}))["error"]["code"] == "item_not_found"
+    assert run(r.call("submit_order", {}))["state"] == "submitted"
+
+    be2 = FakeBackend({("GET", f"/tools/order/{SID}"): BackendUnavailable("down")})
+    r2 = router(be2)
+
+    async def go():
+        await r2.call("update_order", {"action": "add", "item_id": "coke"})
+        await r2.call("get_order", {})  # fails: the read-back did not happen
+        return await r2.call("submit_order", {})
+
+    assert run(go())["error"]["code"] == INVALID_ARGUMENTS
