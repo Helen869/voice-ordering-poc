@@ -64,10 +64,24 @@ def test_money_must_come_from_an_earlier_tool_result():
     assert not passed and "$13.00" in detail
 
 
-def test_base_price_is_not_an_allowed_amount():
-    r = run_of(step(calls=[call("search_menu", result={"matches": [{"base_price": 9.99}]})],
-                    agent="Fried rice is $9.99."))
-    assert not check_money_from_tools({}, r)[0]
+SEARCH_FRIED_RICE = {"matches": [{"id": "fried-rice", "base_price": 9.99, "modifiers": [
+    {"name": "protein", "options": [{"name": "vegetable", "price_delta": 0.0},
+                                    {"name": "shrimp", "price_delta": 2.5}]}]}]}
+
+
+def test_base_price_and_modifier_prices_are_allowed_verbatim():
+    r = run_of(step(calls=[call("search_menu", result=SEARCH_FRIED_RICE)],
+                    agent="Fried rice is $9.99, and shrimp adds two dollars and fifty cents."))
+    passed, detail = check_money_from_tools({}, r)
+    assert passed and detail == "2 amount(s) verified"
+
+
+def test_computed_sum_not_in_any_result_fails():
+    # 9.99 + 2.50 = 12.49 is correct arithmetic, but no tool result contains it.
+    r = run_of(step(calls=[call("search_menu", result=SEARCH_FRIED_RICE)],
+                    agent="Shrimp fried rice would be twelve forty-nine."))
+    passed, detail = check_money_from_tools({}, r)
+    assert not passed and "$12.49" in detail
 
 
 # -- submit / required modifiers --------------------------------------------------

@@ -25,7 +25,8 @@ from typing import Any, Iterable, Optional
 
 MENU_PATH = Path(__file__).resolve().parent.parent / "data" / "menu.json"
 
-PRICE_FIELDS = ("subtotal", "unit_price", "line_total")
+# Price fields a spoken amount may be quoted from, verbatim (never a computed sum).
+PRICE_FIELDS = ("subtotal", "unit_price", "line_total", "base_price", "price_delta")
 
 # Error codes whose spoken form would never occur in natural speech.
 LEAK_CODES = (
@@ -118,7 +119,7 @@ def spoken_amounts(text: str) -> list[float]:
 
 
 def price_values(result: Any) -> set[float]:
-    """Every subtotal / unit_price / line_total anywhere in a tool result."""
+    """Every PRICE_FIELDS value anywhere in a tool result (incl. modifier option prices)."""
     found: set[float] = set()
     if isinstance(result, dict):
         for key, value in result.items():
@@ -211,7 +212,8 @@ def check_forbidden_calls(case: dict, run: dict) -> CheckResult:
 
 
 def check_money_from_tools(case: dict, run: dict) -> CheckResult:
-    """Every spoken dollar amount equals a price field from an earlier tool result."""
+    """Every spoken dollar amount appears verbatim in a price field of an earlier
+    tool result. Sums the agent computed itself (not in any result) fail."""
     allowed: set[float] = set()
     bad, spoken = [], 0
     for index, step in enumerate(run["steps"]):
