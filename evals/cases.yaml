@@ -17,7 +17,8 @@
 #                   confirmation number spoken.
 #
 # Always-on checks: completed, money_from_tools, no_premature_submit,
-# required_modifiers_from_caller, no_leaks.
+# required_modifiers_from_caller, no_leaks, confirmation_numbers,
+# submit_at_most_once.
 
 cases:
   - id: ex1_normal_order
@@ -132,7 +133,7 @@ cases:
   - id: barge_in_after_yes
     description: "Caller talks over the agent right after 'yes'; order still placed once and number still heard"
     steps:
-      - say: "One Coke please. That's all."
+      - say: "One Coke, not Diet. That's all."
         forbid_calls: [submit_order]
       - say: "Yes, place the order."
         explicit_yes: true
@@ -144,6 +145,22 @@ cases:
       - name: submit_order
     final:
       state: submitted
+      items:
+        - {item_id: coke, quantity: 1}
+      subtotal: 2.99
+
+  - id: coke_or_diet_ambiguous
+    description: "'Coke' matches Coke and Diet Coke: ask which, add nothing until the caller answers"
+    steps:
+      - say: "One Coke, please."
+        forbid_calls: [update_order, submit_order]
+        say_all: [diet]
+      - say: "Regular Coke."
+    expect_calls:
+      - name: update_order
+        args: {action: add, item_id: coke, quantity: 1}
+    final:
+      state: draft
       items:
         - {item_id: coke, quantity: 1}
       subtotal: 2.99

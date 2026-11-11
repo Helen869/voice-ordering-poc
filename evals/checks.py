@@ -346,6 +346,68 @@ def check_final_order(case: dict, run: dict) -> CheckResult:
     return (not problems), ("ok" if not problems else "; ".join(problems))
 
 
+# "GW-1045", "GW 1045", "G W 1 0 4 5", "confirmation number is 1045"
+_SPOKEN_CONFIRMATION = re.compile(
+    r"\bG\s*\.?\s*-?\s*W\b\s*\.?\s*[-#:]?\s*((?:\d[\s-]?){4})"
+    r"|confirmation number(?: is)?\s*:?\s*((?:\d[\s-]?){4})",
+    re.IGNORECASE,
+)
+
+
+def _successful_submits(run: dict) -> list[dict]:
+    return [c["result"] for _, c in _all_calls(run)
+            if c["name"] == "submit_order" and "error" not in c["result"]
+            and c["result"].get("state") == "submitted" and c["result"].get("confirmation_number")]
+
+
+def check_confirmation_numbers(case: dict, run: dict) -> CheckResult:
+    """Every spoken confirmation number equals one submit_order returned, and is
+    spoken only after that result arrived (by event order). Digit forms only:
+    a number read as words is not detected here."""
+    events = run.get("events")
+    if not events:
+        return None
+    text, ends = "", []  # concatenated agent speech; (end offset, seq) per chunk
+    returned: dict[str, int] = {}  # digits -> seq of the first result returning it
+    for ev in events:
+        if ev["type"] == "agent_text":
+            text += ev["text"]
+            ends.append((len(text), ev["seq"]))
+        elif (ev["type"] == "tool_result" and ev.get("name") == "submit_order"
+              and "error" not in ev["result"] and ev["result"].get("confirmation_number")):
+            digits = re.sub(r"\D", "", ev["result"]["confirmation_number"])
+            returned.setdefault(digits, ev["seq"])
+    spoken = []
+    for m in _SPOKEN_CONFIRMATION.finditer(text):
+        digits = re.sub(r"\D", "", m.group(1) or m.group(2))
+        seq = next(s for end, s in ends if end >= m.end())  # chunk that completed it
+        spoken.append((digits, seq))
+    if not spoken and not returned:
+        return None
+    problems = []
+    for digits, seq in spoken:
+        if digits not in returned:
+            problems.append(f"spoke GW-{digits}, but submit_order returned "
+                            f"{', '.join('GW-' + d for d in returned) or 'none'}")
+        elif seq < returned[digits]:
+            problems.append(f"spoke GW-{digits} before submit_order returned it")
+    return (not problems), ("ok: " + ", ".join(f"GW-{d}" for d, _ in spoken) if not problems
+                            else "; ".join(problems))
+
+
+def check_submit_at_most_once(case: dict, run: dict) -> CheckResult:
+    """One successful submit_order per order (a repeat returns already_submitted)."""
+    submits = _successful_submits(run)
+    if not submits:
+        return None
+    counts: dict[str, int] = {}
+    for result in submits:
+        counts[result["confirmation_number"]] = counts.get(result["confirmation_number"], 0) + 1
+    repeated = {k: v for k, v in counts.items() if v > 1}
+    return (not repeated), ("ok" if not repeated else
+                            "; ".join(f"{k} submitted {v} times" for k, v in repeated.items()))
+
+
 CHECKS = {
     "completed": check_completed,
     "expected_calls": check_expected_calls,
@@ -356,6 +418,8 @@ CHECKS = {
     "speech": check_speech,
     "no_leaks": check_no_leaks,
     "final_order": check_final_order,
+    "confirmation_numbers": check_confirmation_numbers,
+    "submit_at_most_once": check_submit_at_most_once,
 }
 
 

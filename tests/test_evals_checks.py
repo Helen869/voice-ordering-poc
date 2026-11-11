@@ -185,7 +185,7 @@ def _price(item_id, modifiers):
 
 def test_cases_file_is_valid_and_matches_menu():
     cases = _cases()
-    assert len({c["id"] for c in cases}) == len(cases) == 10
+    assert len({c["id"] for c in cases}) == len(cases) == 11
     for case in cases:
         assert case["steps"] and all(s.get("say") for s in case["steps"]), case["id"]
         for exp in case.get("expect_calls", []):
@@ -237,3 +237,62 @@ def test_wait_turn_done_times_out():
 
     with pytest.raises(asyncio.TimeoutError):
         asyncio.run(_wait_turn_done(asyncio.Queue(), Bridge(), timeout=0.1, settle=0.05))
+
+
+# -- confirmation numbers and submit-once -----------------------------------------------
+from evals.checks import check_confirmation_numbers, check_submit_at_most_once
+
+SUBMIT_OK = {"state": "submitted", "confirmation_number": "GW-1045"}
+
+
+def ev_run(*events, steps=None):
+    seq = [dict(e, seq=i) for i, e in enumerate(events)]
+    return {"events": seq, "steps": steps or [step()], "final_order": {}, "error": None}
+
+
+def said(text):
+    return {"type": "agent_text", "text": text}
+
+
+def returned(result=SUBMIT_OK):
+    return {"type": "tool_result", "name": "submit_order", "result": result}
+
+
+def test_confirmation_spoken_after_result_passes():
+    r = ev_run(returned(), said("Order placed! Your confirmation "), said("number is GW-10"), said("45."))
+    assert check_confirmation_numbers({}, r) == (True, "ok: GW-1045")
+
+
+def test_wrong_confirmation_number_fails():
+    r = ev_run(returned(), said("Your confirmation number is GW-1042."), said(" Sorry, GW-1045."))
+    passed, detail = check_confirmation_numbers({}, r)
+    assert not passed and "spoke GW-1042, but submit_order returned GW-1045" in detail
+
+
+def test_confirmation_spoken_before_result_fails():
+    r = ev_run(said("Your confirmation number is GW-1045."), returned())
+    passed, detail = check_confirmation_numbers({}, r)
+    assert not passed and "before submit_order returned it" in detail
+
+
+def test_number_spoken_but_never_returned_fails():
+    r = ev_run(said("Your confirmation number is GW-1042."))
+    passed, detail = check_confirmation_numbers({}, r)
+    assert not passed and "returned none" in detail
+
+
+def test_confirmation_check_not_applicable_without_numbers():
+    assert check_confirmation_numbers({}, ev_run(said("Two Cokes, $5.98."))) is None
+    assert check_confirmation_numbers({}, {"steps": [], "final_order": {}}) is None  # old reports
+
+
+def test_submit_at_most_once():
+    once = run_of(step(calls=[call("get_order"), call("submit_order", result=SUBMIT_OK)]))
+    assert check_submit_at_most_once({}, once) == (True, "ok")
+    twice = run_of(step(calls=[call("submit_order", result=SUBMIT_OK)]),
+                   step(calls=[call("submit_order", result={**SUBMIT_OK, "already_submitted": True})]))
+    passed, detail = check_submit_at_most_once({}, twice)
+    assert not passed and "GW-1045 submitted 2 times" in detail
+    refused = run_of(step(calls=[call("submit_order", result={"error": {"code": "invalid_arguments"}}),
+                                 call("submit_order", result=SUBMIT_OK)]))
+    assert check_submit_at_most_once({}, refused)[0]  # a refused attempt is not a submit

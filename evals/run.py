@@ -68,11 +68,45 @@ class SwitchableBackend:
         return await self.inner.request(method, path, params=params, json=json)
 
 
+class EventLog:
+    """Ordered record of everything in a run (seq = order of occurrence)."""
+
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+        self._t0 = time.monotonic()
+
+    def add(self, type_: str, step: int, **fields: Any) -> None:
+        self.events.append({"seq": len(self.events), "t": round(time.monotonic() - self._t0, 3),
+                            "type": type_, "step": step, **fields})
+
+
+class LoggingSession:
+    """Live session proxy given to the bridge only: logs its tool responses and
+    System notes (caller turns are sent on the raw session and logged as "caller")."""
+
+    def __init__(self, session: Any, log: EventLog, state: "TurnState") -> None:
+        self._session, self._log, self._state = session, log, state
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._session, name)
+
+    async def send_tool_response(self, *, function_responses):
+        self._log.add("tool_response_sent", self._state.step,
+                      ids=[r["id"] for r in function_responses], names=[r["name"] for r in function_responses])
+        await self._session.send_tool_response(function_responses=function_responses)
+
+    async def send_realtime_input(self, **kwargs):
+        if kwargs.get("text") is not None and "audio" not in kwargs:
+            self._log.add("system_note_sent", self._state.step, text=kwargs["text"])
+        await self._session.send_realtime_input(**kwargs)
+
+
 class RecordingRouter:
     """Wraps ToolRouter; records every call with the caller turn it happened in."""
 
-    def __init__(self, router: ToolRouter) -> None:
+    def __init__(self, router: ToolRouter, log: Optional[EventLog] = None) -> None:
         self._router = router
+        self._log = log
         self.step = 0
         self.calls: list[dict] = []
 
@@ -83,6 +117,8 @@ class RecordingRouter:
     async def call(self, name: str, args: Optional[dict]) -> dict:
         result = await self._router.call(name, args)
         self.calls.append({"step": self.step, "name": name, "args": dict(args or {}), "result": result})
+        if self._log:
+            self._log.add("tool_result", self.step, name=name, args=dict(args or {}), result=result)
         return result
 
 
@@ -95,13 +131,22 @@ class TurnState:
         self.agent = [""] * n_steps
 
 
-async def _read_loop(session: Any, bridge: CallBridge, state: TurnState, events: asyncio.Queue) -> None:
+async def _read_loop(session: Any, bridge: CallBridge, state: TurnState, events: asyncio.Queue,
+                     log: EventLog) -> None:
     try:
         while True:  # receive() stops after each completed turn
             async for msg in session.receive():
                 sc = msg.server_content
                 if sc and sc.output_transcription and sc.output_transcription.text:
                     state.agent[state.step] += sc.output_transcription.text
+                    log.add("agent_text", state.step, text=sc.output_transcription.text)
+                if msg.tool_call:
+                    fcs = msg.tool_call.function_calls or []
+                    log.add("tool_call", state.step, ids=[f.id for f in fcs], names=[f.name for f in fcs])
+                if msg.tool_call_cancellation:
+                    log.add("tool_call_cancellation", state.step, ids=list(msg.tool_call_cancellation.ids or []))
+                if sc and (sc.turn_complete or sc.interrupted):
+                    log.add("turn_complete" if sc.turn_complete else "interrupted", state.step)
                 await bridge.on_message(msg)
                 if sc and sc.turn_complete:
                     events.put_nowait("turn_complete")
@@ -147,7 +192,8 @@ async def run_case(client: Any, case: dict, args: argparse.Namespace) -> dict:
     session_id = f"eval-{case['id']}-{uuid.uuid4().hex[:8]}"
     http = HttpBackend("http://backend", transport=httpx.ASGITransport(app=app), timeout=10)
     backend = SwitchableBackend(http)
-    recorder = RecordingRouter(ToolRouter(backend, session_id))
+    log = EventLog()
+    recorder = RecordingRouter(ToolRouter(backend, session_id), log)
     bridge = CallBridge(recorder, language=args.language or None)
     state = TurnState(len(steps))
     events: asyncio.Queue = asyncio.Queue()
@@ -161,12 +207,13 @@ async def run_case(client: Any, case: dict, args: argparse.Namespace) -> dict:
         if spec.get("backend") in ("down", "up"):
             backend.down = spec["backend"] == "down"
         state.step = recorder.step = index
+        log.add("caller", index, text=spec["say"])
 
     try:
         async with client.aio.live.connect(model=args.model, config=config) as session:
-            bridge.attach(session)
+            bridge.attach(LoggingSession(session, log, state))  # bridge sends only
             worker = asyncio.create_task(bridge.run_tools())
-            reader = asyncio.create_task(_read_loop(session, bridge, state, events))
+            reader = asyncio.create_task(_read_loop(session, bridge, state, events, log))
             try:
                 i = 0
                 while i < len(steps):
@@ -204,6 +251,7 @@ async def run_case(client: Any, case: dict, args: argparse.Namespace) -> dict:
         ],
         "final_order": order_service.get_order(session_id).model_dump(),
         "tool_call_cancellation_seen": cancelled,
+        "events": log.events,
         "seconds": round(time.monotonic() - started, 1),
         "error": error,
     }
