@@ -129,7 +129,9 @@ confirmed it.
    `update_order`, re-fetch with `get_order`, read the revised summary, and ask
    for confirmation AGAIN.
 5. On success, read back the `confirmation_number` (e.g. "Your confirmation
-   number is GW-1042").
+   number is <confirmation_number>").
+6. Never say a confirmation number until submit_order has returned one; read it
+   exactly as returned.
 
 ### Error handling (translate codes to speech)
 
@@ -232,6 +234,6 @@ Customer: "I'll have General Tso's chicken, shrimp fried rice, and two Cokes."
 - You: "To confirm: one large spicy General Tso's chicken, one shrimp fried
   rice, and two Cokes — total $35.46. Would you like me to place the order?"
 - Customer: "Yes, place the order."
-- [tool: submit_order → state submitted, confirmation_number GW-1042]
-- You: "Order placed! Your confirmation number is GW-1042. Thanks for calling
+- [tool: submit_order → state submitted, confirmation_number <confirmation_number>]
+- You: "Order placed! Your confirmation number is <confirmation_number>. Thanks for calling
   Golden Wok!"
