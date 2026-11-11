@@ -2,8 +2,8 @@
 
     python -m live.bridge.local_harness [--backend URL] [--model NAME]
 
-Needs GEMINI_API_KEY (or GOOGLE_API_KEY) and the FastAPI backend running
-locally. Use headphones: with open speakers the model hears itself and
+Needs GEMINI_API_KEY (or GOOGLE_API_KEY), set in the environment or in a
+.env file at the repo root, and the FastAPI backend running locally. Use headphones: with open speakers the model hears itself and
 interrupts its own turns. Ctrl+C hangs up.
 
 Mic: 16 kHz mono 16-bit PCM in. Speaker: 24 kHz mono 16-bit PCM out.
@@ -17,14 +17,23 @@ import logging
 import os
 import sys
 import threading
+from pathlib import Path
 from typing import Optional
 
 import httpx
 import sounddevice as sd
-from google import genai
+from dotenv import load_dotenv
 
-from live.bridge.call import CallBridge, new_session_id
+from live.bridge.call import (
+    LIVE_API_VERSION,
+    CallBridge,
+    LiveHandshakeError,
+    make_live_client,
+    new_session_id,
+)
 from live.bridge.tools import HttpBackend, ToolRouter
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 IN_RATE = 16_000
 OUT_RATE = 24_000
@@ -82,9 +91,23 @@ class LaptopAudio:
             self._playback.clear()
 
 
+logger = logging.getLogger("live_bridge.harness")
+
+
+def _key_suffix(client) -> str:
+    key = getattr(getattr(client, "_api_client", None), "api_key", None) or (
+        os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or ""
+    )
+    return f"...{key[-4:]}" if key else "<none>"
+
+
 async def main(args: argparse.Namespace) -> None:
     if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
         sys.exit("Set GEMINI_API_KEY (or GOOGLE_API_KEY) first.")
+    client = make_live_client(args.api_version)
+    logger.info(
+        "model=%s api_version=%s key=%s", args.model, args.api_version, _key_suffix(client)
+    )
     try:
         httpx.get(f"{args.backend}/health", timeout=3).raise_for_status()
     except httpx.HTTPError as exc:
@@ -100,7 +123,7 @@ async def main(args: argparse.Namespace) -> None:
     audio.start()
     try:
         await bridge.run(
-            genai.Client(), args.model, audio,
+            client, args.model, audio,
             extra_config={"input_audio_transcription": {}, "output_audio_transcription": {}},
         )
     finally:
@@ -113,13 +136,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--backend", default="http://127.0.0.1:8080", help="FastAPI backend base URL")
     p.add_argument("--model", default="gemini-3.8-live", help="Live API model name")
     p.add_argument("--timeout", type=float, default=5.0, help="backend timeout in seconds")
+    p.add_argument(
+        "--api-version", default=LIVE_API_VERSION,
+        help=f"Live API version (default {LIVE_API_VERSION}; 'v1' has no Live endpoint)",
+    )
     return p.parse_args()
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    # Optional; variables already set in the environment take precedence.
+    load_dotenv(REPO_ROOT / ".env")
     try:
         asyncio.run(main(parse_args()))
     except KeyboardInterrupt:
         print("\nHung up.")
+    except LiveHandshakeError as exc:
+        sys.exit(str(exc))

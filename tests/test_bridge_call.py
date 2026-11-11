@@ -176,3 +176,89 @@ def test_system_instruction_excludes_file_preamble():
     text = load_system_instruction()
     assert text.startswith("## Goal")
     assert "Everything below the line" not in text
+
+
+# -- connection handling: fail fast on 4xx, retry otherwise -------------------------
+import logging
+
+import pytest
+from websockets.datastructures import Headers
+from websockets.exceptions import InvalidStatus
+from websockets.http11 import Response
+
+import live.bridge.call as call_mod
+from live.bridge.call import LIVE_API_VERSION, LiveHandshakeError, handshake_rejection
+
+
+def rejected(status, body=b""):
+    return InvalidStatus(Response(status, "x", Headers(), body))
+
+
+class FailingClient:
+    """client.aio.live.connect(...) raises ``exc`` on every attempt."""
+
+    def __init__(self, exc):
+        self.attempts = 0
+        client = self
+
+        class _Conn:
+            async def __aenter__(self):
+                client.attempts += 1
+                raise exc
+
+            async def __aexit__(self, *a):
+                return False
+
+        self.aio = NS(live=NS(connect=lambda **kw: _Conn()))
+
+
+@pytest.fixture()
+def no_sleep(monkeypatch):
+    async def instant(_):
+        return None
+    monkeypatch.setattr(call_mod.asyncio, "sleep", instant)
+
+
+def test_handshake_rejection_reads_status_and_body():
+    assert handshake_rejection(rejected(404)) == (404, "<empty>")
+    assert handshake_rejection(rejected(403, b'{"error": "denied"}')) == (403, '{"error": "denied"}')
+    assert handshake_rejection(rejected(503)) is None
+    assert handshake_rejection(ConnectionError("reset")) is None
+
+
+def test_4xx_handshake_fails_fast_with_body_in_error(no_sleep):
+    client = FailingClient(rejected(404, b"model not found"))
+    with pytest.raises(LiveHandshakeError, match=r"HTTP 404 \(model=m\); response body: model not found"):
+        asyncio.run(CallBridge(FakeRouter()).run(client, "m", audio=None))
+    assert client.attempts == 1
+
+
+def test_other_connection_errors_retry_up_to_limit(no_sleep):
+    client = FailingClient(rejected(503))
+    with pytest.raises(InvalidStatus):
+        asyncio.run(CallBridge(FakeRouter()).run(client, "m", audio=None))
+    assert client.attempts == call_mod.MAX_RECONNECTS
+
+
+def test_reconnect_log_mentions_handle_only_when_present(no_sleep, caplog):
+    caplog.set_level(logging.INFO, logger="live_bridge")
+    with pytest.raises(ConnectionError):
+        asyncio.run(CallBridge(FakeRouter()).run(FailingClient(ConnectionError("x")), "m", audio=None))
+    assert "no resumption handle yet" in caplog.text
+    assert "with resumption handle" not in caplog.text
+
+    caplog.clear()
+    bridge = CallBridge(FakeRouter())
+    bridge.resumption_handle = "h1"
+    with pytest.raises(ConnectionError):
+        asyncio.run(bridge.run(FailingClient(ConnectionError("x")), "m", audio=None))
+    assert "with resumption handle" in caplog.text
+
+
+def test_live_client_uses_v1beta_by_default(monkeypatch):
+    pytest.importorskip("google.genai")
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy-key-for-test")
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    client = call_mod.make_live_client()
+    assert LIVE_API_VERSION == "v1beta"
+    assert client._api_client._http_options.api_version == "v1beta"

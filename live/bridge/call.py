@@ -29,10 +29,35 @@ logger = logging.getLogger("live_bridge")
 SYSTEM_INSTRUCTION_PATH = Path(__file__).resolve().parent.parent / "system-instruction.md"
 INPUT_AUDIO_MIME = "audio/pcm;rate=16000"
 MAX_RECONNECTS = 5
+# The SDK's default api_version ("v1" in google-genai 3.1) has no Live endpoint:
+# the WebSocket handshake fails with HTTP 404 and an empty body.
+LIVE_API_VERSION = "v1beta"
+
+
+class LiveHandshakeError(RuntimeError):
+    """The Live API rejected the WebSocket handshake with a 4xx (not retryable)."""
 
 
 def new_session_id() -> str:
     return f"live-{uuid.uuid4()}"
+
+
+def make_live_client(api_version: str = LIVE_API_VERSION) -> Any:
+    from google import genai
+
+    return genai.Client(http_options={"api_version": api_version})
+
+
+def handshake_rejection(exc: BaseException) -> Optional[tuple[int, str]]:
+    """(status, body) if ``exc`` is a 4xx WebSocket handshake rejection, else None."""
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None)
+    if not isinstance(status, int) or not 400 <= status < 500:
+        return None
+    body = getattr(resp, "body", None) or b""
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", errors="replace")
+    return status, body.strip() or "<empty>"
 
 
 def load_system_instruction(path: Path = SYSTEM_INSTRUCTION_PATH) -> str:
@@ -186,13 +211,23 @@ class CallBridge:
                         failures = 0
                         if await self._pump(session, audio):
                             return  # caller hung up
-                except Exception:
+                except Exception as exc:
+                    rejected = handshake_rejection(exc)
+                    if rejected:
+                        status, body = rejected
+                        raise LiveHandshakeError(
+                            f"Live API rejected the handshake: HTTP {status} "
+                            f"(model={model}); response body: {body}"
+                        ) from exc
                     failures += 1
                     logger.exception("Live session dropped (%d/%d)", failures, MAX_RECONNECTS)
                     if failures >= MAX_RECONNECTS:
                         raise
                     await asyncio.sleep(min(0.5 * failures, 2.0))
-                logger.info("reconnecting call %s with resumption handle", self.session_id)
+                if self.resumption_handle:
+                    logger.info("reconnecting call %s with resumption handle", self.session_id)
+                else:
+                    logger.info("reconnecting call %s (no resumption handle yet)", self.session_id)
         finally:
             worker.cancel()
 
