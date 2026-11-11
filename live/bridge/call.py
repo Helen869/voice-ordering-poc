@@ -34,6 +34,7 @@ MAX_RECONNECTS = 5
 # The SDK's default api_version ("v1" in google-genai 3.1) has no Live endpoint:
 # the WebSocket handshake fails with HTTP 404 and an empty body.
 LIVE_API_VERSION = "v1beta"
+DEFAULT_LANGUAGE = "en-US"
 
 
 class LiveHandshakeError(RuntimeError):
@@ -132,14 +133,23 @@ def load_system_instruction(path: Path = SYSTEM_INSTRUCTION_PATH) -> str:
     return "\n".join(lines[start:]).strip()
 
 
-def build_live_config(resumption_handle: Optional[str], extra: Optional[dict] = None) -> dict:
-    return {
+def build_live_config(
+    resumption_handle: Optional[str],
+    extra: Optional[dict] = None,
+    language: Optional[str] = DEFAULT_LANGUAGE,
+) -> dict:
+    """Live session config. ``language`` sets speech_config.language_code, which
+    governs the agent's speech synthesis; None or "" leaves it to the model."""
+    config: dict = {
         "response_modalities": ["AUDIO"],
         "system_instruction": load_system_instruction(),
         "tools": [{"function_declarations": list(load_declarations().values())}],
-        **(extra or {}),
-        "session_resumption": {"handle": resumption_handle},
     }
+    if language:
+        config["speech_config"] = {"language_code": language}
+    config.update(extra or {})
+    config["session_resumption"] = {"handle": resumption_handle}
+    return config
 
 
 def submit_note(confirmation_number: str) -> str:
@@ -161,8 +171,9 @@ class AudioPort(Protocol):
 
 
 class CallBridge:
-    def __init__(self, router: ToolRouter) -> None:
+    def __init__(self, router: ToolRouter, language: Optional[str] = DEFAULT_LANGUAGE) -> None:
         self.router = router
+        self.language = language
         self.resumption_handle: Optional[str] = None
         self._session: Any = None  # current Live session; replaced on reconnect
         self._calls: asyncio.Queue = asyncio.Queue()
@@ -268,7 +279,7 @@ class CallBridge:
         try:
             while True:
                 try:
-                    config = build_live_config(self.resumption_handle, extra_config)
+                    config = build_live_config(self.resumption_handle, extra_config, self.language)
                     async with client.aio.live.connect(model=model, config=config) as session:
                         self.attach(session)
                         failures = 0

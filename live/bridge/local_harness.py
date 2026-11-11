@@ -29,6 +29,7 @@ import sounddevice as sd
 from dotenv import load_dotenv
 
 from live.bridge.call import (
+    DEFAULT_LANGUAGE,
     LIVE_API_VERSION,
     CallBridge,
     LiveHandshakeError,
@@ -173,7 +174,8 @@ async def main(args: argparse.Namespace) -> None:
 
     client = make_live_client(args.api_version)
     logger.info(
-        "model=%s api_version=%s key=%s", args.model, args.api_version, _key_suffix(client)
+        "model=%s api_version=%s key=%s language=%s", args.model, args.api_version,
+        _key_suffix(client), args.language or "auto",
     )
     try:
         async with httpx.AsyncClient(timeout=3) as http:
@@ -182,7 +184,8 @@ async def main(args: argparse.Namespace) -> None:
         sys.exit(f"Backend not reachable at {args.backend} ({exc}). Start it first.")
 
     backend = HttpBackend(args.backend, timeout=args.timeout)
-    bridge = CallBridge(ToolRouter(backend, new_session_id()))
+    language = args.language or None
+    bridge = CallBridge(ToolRouter(backend, new_session_id()), language=language)
     print(f"\nCall started. session_id = {bridge.session_id}")
     print(f"Inspect the order: curl {args.backend}/tools/order/{bridge.session_id}")
     print("Say hello to begin. Ctrl+C hangs up.\n")
@@ -196,7 +199,11 @@ async def main(args: argparse.Namespace) -> None:
     try:
         await bridge.run(
             client, args.model, audio,
-            extra_config={"input_audio_transcription": {}, "output_audio_transcription": {}},
+            extra_config={
+                # Same language as a hint for the caller-side transcript.
+                "input_audio_transcription": {"language_codes": [language]} if language else {},
+                "output_audio_transcription": {},
+            },
         )
     finally:
         # bridge.run has already cancelled and awaited its own tasks and closed
@@ -216,6 +223,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--api-version", default=LIVE_API_VERSION,
         help=f"Live API version (default {LIVE_API_VERSION}; 'v1' has no Live endpoint)",
+    )
+    p.add_argument(
+        "--language", default=DEFAULT_LANGUAGE,
+        help=f"BCP-47 code for speech_config and the transcript hint (default "
+             f"{DEFAULT_LANGUAGE}; '' = let the model choose)",
     )
     p.add_argument("--input-device", help="mic: device index or name substring")
     p.add_argument("--output-device", help="speaker: device index or name substring")

@@ -403,3 +403,31 @@ def test_harness_parse_device():
     assert parse_device(None) is None
     assert parse_device("3") == 3
     assert parse_device("Headset") == "Headset"
+
+
+# -- language -------------------------------------------------------------------------
+def test_live_config_sets_speech_language_by_default():
+    cfg = build_live_config(None)
+    assert cfg["speech_config"] == {"language_code": "en-US"}
+
+
+def test_live_config_language_override_and_disable():
+    assert build_live_config(None, language="en-GB")["speech_config"] == {"language_code": "en-GB"}
+    assert "speech_config" not in build_live_config(None, language=None)
+    assert "speech_config" not in build_live_config(None, language="")
+
+
+def test_bridge_passes_language_to_config():
+    async def go():
+        seen = []
+        client = OkClient(ScriptedSession())
+        connect = client.aio.live.connect
+        client.aio.live.connect = lambda **kw: (seen.append(kw["config"]), connect(**kw))[1]
+        call = asyncio.create_task(
+            CallBridge(FakeRouter(), language="en-AU").run(client, "m", ScriptedAudio()))
+        await asyncio.sleep(0.05)
+        call.cancel()
+        await asyncio.gather(call, return_exceptions=True)
+        return seen
+
+    assert asyncio.run(go())[0]["speech_config"] == {"language_code": "en-AU"}
