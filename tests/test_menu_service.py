@@ -63,3 +63,37 @@ def test_search_blank_query_returns_empty(menu_service):
 
 def test_get_item_unknown_returns_none(menu_service):
     assert menu_service.get_item("not-a-real-item") is None
+
+
+# -- token pass: item name plus that item's own option values -------------------------
+import pytest
+
+
+@pytest.mark.parametrize("query,expected", [
+    ("beef lo mein", {"lo-mein"}),
+    ("chicken lo mein", {"lo-mein"}),
+    ("shrimp fried rice", {"fried-rice"}),
+    ("Vegetable Chow Mein", {"chow-mein"}),
+    ("large General Tso's chicken", {"general-tsos-chicken"}),
+    ("spicy kung pao chicken", {"kung-pao-chicken"}),
+    ("large coke", {"coke"}),
+])
+def test_search_name_plus_option_values(menu_service, query, expected):
+    assert {item.id for item in menu_service.search_menu(query)} == expected
+
+
+@pytest.mark.parametrize("query", [
+    "pork lo mein",            # pork is not a lo mein option
+    "large fried rice",        # size is not a fried rice modifier
+    "spicy egg rolls",         # egg rolls have no modifiers
+    "beef lo mein with extra sauce",  # extra words that are not option values
+])
+def test_search_extra_tokens_must_be_that_items_options(menu_service, query):
+    assert menu_service.search_menu(query) == []
+
+
+def test_search_substring_results_unchanged(menu_service):
+    # Queries the substring pass already answered keep their old results.
+    assert {i.id for i in menu_service.search_menu("lo mein")} == {"lo-mein"}
+    assert {i.id for i in menu_service.search_menu("fried rice")} == {"fried-rice"}
+    assert len(menu_service.search_menu("chicken")) > 3

@@ -7,6 +7,7 @@ modifiers and availability. The LLM must always consult these methods
 
 import difflib
 import json
+import re
 from pathlib import Path
 from typing import List, Optional
 
@@ -19,6 +20,22 @@ _MENU_PATH = Path(__file__).resolve().parent.parent / "data" / "menu.json"
 # 0.7 keeps genuine typos ("chiken" -> "chicken" scores 0.92) while rejecting
 # unrelated words ("cheeseburger" -> "cheese" only scores 0.67).
 _FUZZY_CUTOFF = 0.7
+
+
+def _tokens(text: str) -> set:
+    """Lowercase word tokens; apostrophes dropped so "Tso's" -> "tsos"."""
+    return set(re.findall(r"[a-z0-9]+", re.sub(r"['’]", "", text.lower())))
+
+
+def _name_with_options_match(item: MenuItem, query_tokens: set) -> bool:
+    name_tokens = _tokens(item.name)
+    if not name_tokens or not name_tokens <= query_tokens:
+        return False
+    option_tokens = set()
+    for modifier in item.modifiers:
+        for option in modifier.options:
+            option_tokens |= _tokens(option.name)
+    return (query_tokens - name_tokens) <= option_tokens
 
 
 class MenuService:
@@ -71,6 +88,14 @@ class MenuService:
         if not q:
             return []
         matches = [item for item in self._menu.items if q in self._search_text(item)]
+        if matches:
+            return matches
+        # Token pass: "beef lo mein", "shrimp fried rice", "large general tso's
+        # chicken". The item matches if every token of its name is in the query
+        # and every extra query token is an option value of that item's own
+        # modifiers (no hardcoded protein list).
+        q_tokens = _tokens(q)
+        matches = [item for item in self._menu.items if _name_with_options_match(item, q_tokens)]
         if matches:
             return matches
         # Fuzzy fallback: match the query against individual search tokens so a
