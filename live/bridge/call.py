@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from array import array
 from collections import Counter
@@ -144,12 +145,38 @@ def build_live_config(
         "response_modalities": ["AUDIO"],
         "system_instruction": load_system_instruction(),
         "tools": [{"function_declarations": list(load_declarations().values())}],
+        # The confirmation-number guard reads the agent's transcript.
+        "output_audio_transcription": {},
     }
     if language:
         config["speech_config"] = {"language_code": language}
     config.update(extra or {})
     config["session_resumption"] = {"handle": resumption_handle}
     return config
+
+
+# Spoken confirmation numbers: "GW-1045", "GW 1045", "G W 1 0 4 5",
+# "confirmation number is 1045". Captures the whole number (GW-12345 too).
+SPOKEN_CONFIRMATION = re.compile(
+    r"\bG\s*\.?\s*-?\s*W\b\s*\.?\s*[-#:]?\s*((?:\d[\s-]?){3,}\d)(?!\d)"
+    r"|confirmation number(?: is)?\s*:?\s*((?:\d[\s-]?){3,}\d)(?!\d)",
+    re.IGNORECASE,
+)
+
+
+def spoken_confirmation_numbers(text: str) -> list[tuple[str, int]]:
+    """(digits, end offset) for every confirmation number in ``text``."""
+    return [(re.sub(r"\D", "", m.group(1) or m.group(2)), m.end())
+            for m in SPOKEN_CONFIRMATION.finditer(text)]
+
+
+def wrong_number_note(real: str) -> str:
+    return (f"System note: You said the wrong confirmation number. "
+            f"Correct yourself: the confirmation number is {real}.")
+
+
+NO_NUMBER_NOTE = ("System note: You said a confirmation number, but the order has not "
+                  "been placed, so there is no confirmation number yet. Correct yourself.")
 
 
 def submit_note(confirmation_number: str) -> str:
@@ -184,6 +211,12 @@ class CallBridge:
         self._model_idle = True
         self.stats: Optional[PumpStats] = None  # set by --debug
         self._pending_tools = 0  # queued or running function calls
+        # Confirmation-number guard
+        self._confirmation: Optional[str] = None  # from a successful submit_order
+        self._turn_text = ""  # agent transcript of the current turn
+        self._turn_scanned = 0  # offset up to which numbers were checked
+        self._early: list[str] = []  # numbers spoken before any submit result
+        self._corrected: set[str] = set()  # wrong numbers already noted
 
     @property
     def tools_idle(self) -> bool:
@@ -223,9 +256,17 @@ class CallBridge:
                 tr = getattr(content, attr, None)
                 if tr and getattr(tr, "text", None):
                     logger.info("[%s] %s", who, tr.text)
+                    if who == "agent":
+                        self._turn_text += tr.text
+                        self._check_spoken_numbers(final=False)
             if content.model_turn:
                 self._model_idle = False
             if content.turn_complete or content.interrupted:
+                self._check_spoken_numbers(final=True)
+                if self._early and not self._confirmation:
+                    self._queue_text("no-number", NO_NUMBER_NOTE)
+                    self._early.clear()
+                self._turn_text, self._turn_scanned = "", 0
                 self._model_idle = True
                 await self._maybe_flush_notes()
 
@@ -262,19 +303,52 @@ class CallBridge:
             if fc.id in self._cancelled:  # cancelled while the batch ran
                 logger.info("not responding to cancelled call %s (%s)", fc.id, fc.name)
                 if fc.id in submits:
+                    self._set_confirmation(submits[fc.id])
                     self._queue_note(submits.pop(fc.id))
                 continue
             live.append({"id": fc.id, "name": fc.name, "response": result})
         if live:
             await self._session.send_tool_response(function_responses=live)
+        for number in submits.values():
+            self._set_confirmation(number)
         self._sent_submits.update(submits)
         await self._maybe_flush_notes()
 
+    # -- confirmation-number guard -------------------------------------------
+    def _set_confirmation(self, number: str) -> None:
+        self._confirmation = number
+        for digits in self._early:  # spoken before the result existed
+            self._handle_spoken(digits)
+        self._early.clear()
+
+    def _check_spoken_numbers(self, final: bool) -> None:
+        """Check numbers in the agent's transcript. Mid-turn, only numbers
+        followed by more text are taken (the next chunk may add digits)."""
+        for digits, end in spoken_confirmation_numbers(self._turn_text):
+            if end <= self._turn_scanned or (not final and end >= len(self._turn_text)):
+                continue
+            self._turn_scanned = end
+            self._handle_spoken(digits)
+
+    def _handle_spoken(self, digits: str) -> None:
+        if self._confirmation is None:
+            self._early.append(digits)
+            return
+        real = re.sub(r"\D", "", self._confirmation)
+        if digits != real and digits not in self._corrected:
+            self._corrected.add(digits)
+            logger.info("agent said wrong confirmation number %s (real %s)", digits, self._confirmation)
+            self._queue_text(f"wrong-{digits}", wrong_number_note(self._confirmation))
+
     # -- system notes -------------------------------------------------------
     def _queue_note(self, confirmation_number: str) -> None:
-        if confirmation_number not in self._noted:
-            self._noted.add(confirmation_number)
-            self._notes.append(submit_note(confirmation_number))
+        self._queue_text(confirmation_number, submit_note(confirmation_number))
+
+    def _queue_text(self, key: str, note: str) -> None:
+        """Queue a System note once per key; sent when the model is idle."""
+        if key not in self._noted:
+            self._noted.add(key)
+            self._notes.append(note)
 
     async def _maybe_flush_notes(self) -> None:
         if not self._model_idle or self._session is None:

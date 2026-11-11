@@ -479,3 +479,113 @@ def test_call_cancelled_mid_batch_is_left_out_of_the_response():
         return session
 
     assert asyncio.run(go()).batches == [["b"]]
+
+
+# -- confirmation-number guard --------------------------------------------------------
+from live.bridge.call import NO_NUMBER_NOTE, spoken_confirmation_numbers, wrong_number_note
+
+PLACED = {"state": "submitted", "confirmation_number": "GW-1046"}
+
+
+def agent_said(text, turn_complete=False):
+    return msg(server_content=NS(model_turn=NS(parts=[]), turn_complete=turn_complete,
+                                 interrupted=False, output_transcription=NS(text=text)))
+
+
+async def placed_bridge():
+    """A bridge whose order was just submitted as GW-1046."""
+    session = FakeSession()
+    bridge = CallBridge(FakeRouter(result=PLACED))
+    bridge.attach(session)
+    worker = asyncio.create_task(bridge.run_tools())
+    await bridge.on_message(tool_call(("s1", "submit_order", None)))
+    await drain(bridge)
+    return bridge, session, worker
+
+
+def test_spoken_confirmation_numbers():
+    assert spoken_confirmation_numbers("Your confirmation number is GW-1046. Thanks") == [("1046", 35)]
+    assert spoken_confirmation_numbers("G W 1 0 4 6 and GW-12345") == [("1046", 11), ("12345", 24)]
+    assert spoken_confirmation_numbers("That's $10.46 total") == []
+
+
+def test_wrong_number_triggers_correction_note_after_the_turn():
+    async def go():
+        bridge, session, worker = await placed_bridge()
+        await bridge.on_message(agent_said("Order placed! Your confirmation number is GW-1042. "))
+        held = list(session.texts)  # model still speaking: note waits
+        await bridge.on_message(agent_said("Thanks for calling!", turn_complete=True))
+        worker.cancel()
+        return held, session.texts
+
+    held, texts = asyncio.run(go())
+    assert held == []
+    assert texts == [wrong_number_note("GW-1046")]
+    assert texts[0] == ("System note: You said the wrong confirmation number. "
+                        "Correct yourself: the confirmation number is GW-1046.")
+
+
+def test_correct_number_sends_nothing():
+    async def go():
+        bridge, session, worker = await placed_bridge()
+        await bridge.on_message(agent_said("Your confirmation number is GW-10"))
+        await bridge.on_message(agent_said("46. Thanks!", turn_complete=True))  # split across chunks
+        worker.cancel()
+        return session.texts
+
+    assert asyncio.run(go()) == []
+
+
+def test_number_split_across_chunks_is_read_whole():
+    async def go():
+        bridge, session, worker = await placed_bridge()
+        await bridge.on_message(agent_said("Your number is GW-104"))
+        await bridge.on_message(agent_said("6"))  # still GW-1046: must not judge "104"/"1046" early
+        await bridge.on_message(agent_said("5.", turn_complete=True))  # actually GW-10465
+        worker.cancel()
+        return session.texts
+
+    assert asyncio.run(go()) == [wrong_number_note("GW-1046")]
+
+
+def test_same_wrong_number_corrected_once():
+    async def go():
+        bridge, session, worker = await placed_bridge()
+        await bridge.on_message(agent_said("It's GW-1042, yes GW-1042.", turn_complete=True))
+        await bridge.on_message(agent_said("Again, GW-1042.", turn_complete=True))
+        worker.cancel()
+        return session.texts
+
+    assert asyncio.run(go()) == [wrong_number_note("GW-1046")]
+
+
+def test_early_number_checked_when_result_arrives():
+    async def go(early):
+        session = FakeSession()
+        bridge = CallBridge(FakeRouter(result=PLACED))
+        bridge.attach(session)
+        worker = asyncio.create_task(bridge.run_tools())
+        await bridge.on_message(agent_said(f"Your confirmation number is {early}. "))  # before submit
+        await bridge.on_message(tool_call(("s1", "submit_order", None)))
+        await drain(bridge)
+        await bridge.on_message(content(turn_complete=True))
+        worker.cancel()
+        return session.texts
+
+    assert asyncio.run(go("GW-5555")) == [wrong_number_note("GW-1046")]
+    assert asyncio.run(go("GW-1046")) == []  # lucky guess: same number, nothing to correct
+
+
+def test_number_spoken_with_no_order_placed_gets_no_number_note():
+    async def go():
+        session = FakeSession()
+        bridge = CallBridge(FakeRouter())
+        bridge.attach(session)
+        await bridge.on_message(agent_said("Your confirmation number is GW-1042.", turn_complete=True))
+        return session.texts
+
+    assert asyncio.run(go()) == [NO_NUMBER_NOTE]
+
+
+def test_live_config_always_has_output_transcription():
+    assert build_live_config(None)["output_audio_transcription"] == {}
