@@ -361,6 +361,12 @@ def print_report(meta: dict, per_case: dict, per_check: dict, results: dict, thr
             print(f"  {cid} run {n}: {bad}")
     info = [(cid, n, k, v["detail"]) for cid, runs in results.items() for n, run in enumerate(runs, 1)
             for k, v in run["checks"].items() if not v["passed"] and not v.get("counted", True)]
+    warnings = [(cid, n, k, v["detail"]) for cid, runs in results.items() for n, run in enumerate(runs, 1)
+                for k, v in run["checks"].items() if v.get("warning")]
+    if warnings:
+        print(f"\nwarnings ({len(warnings)}, not failures):")
+        for cid, n, k, detail in warnings:
+            print(f"  {cid} run {n}: {k}: {detail}")
     if info:
         print("\nnot counted for these cases (only_checks), for information:")
         for cid, n, k, detail in info:

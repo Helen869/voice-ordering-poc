@@ -175,8 +175,8 @@ def wrong_number_note(real: str) -> str:
             f"Correct yourself: the confirmation number is {real}.")
 
 
-NO_NUMBER_NOTE = ("System note: You said a confirmation number, but the order has not "
-                  "been placed, so there is no confirmation number yet. Correct yourself.")
+NO_NUMBER_NOTE = ("System note: no order has been placed yet, so there is no "
+                  "confirmation number. Don't give one until the order is placed.")
 
 
 def submit_note(confirmation_number: str) -> str:

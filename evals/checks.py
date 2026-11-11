@@ -39,6 +39,7 @@ LEAK_CODES = (
 )
 
 CheckResult = Optional[tuple[bool, str]]
+WARNING_PREFIX = "warning: "  # a passing check whose detail starts with this is a warning
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +290,7 @@ def check_speech(case: dict, run: dict) -> CheckResult:
 
 
 def check_no_leaks(case: dict, run: dict) -> CheckResult:
-    """No error codes, JSON or system notes read aloud."""
+    """No error codes, JSON, markdown or markup, or system notes in the speech."""
     text = " ".join(step["agent"] for step in run["steps"])
     low = text.lower()
     leaks = [c for c in LEAK_CODES if c in low or c.replace("_", " ") in low]
@@ -297,6 +298,12 @@ def check_no_leaks(case: dict, run: dict) -> CheckResult:
         leaks.append("System note")
     if "{" in text or "}" in text:
         leaks.append("JSON braces")
+    if "```" in text:
+        leaks.append("code fence")
+    if re.search(r"^\s*-{3,}\s*$", text, re.MULTILINE):
+        leaks.append("markdown rule (---)")
+    if re.search(r"<[a-z ]+>", low):
+        leaks.append("markup tag " + re.search(r"<[a-z ]+>", low).group(0))
     return (not leaks), ("ok" if not leaks else "spoke: " + ", ".join(leaks))
 
 
@@ -465,16 +472,21 @@ def check_get_order_before_submit(case: dict, run: dict) -> CheckResult:
 
 
 def check_submit_at_most_once(case: dict, run: dict) -> CheckResult:
-    """One successful submit_order per order (a repeat returns already_submitted)."""
+    """One successful submit_order per order. A repeat that the backend answered
+    with already_submitted (no second order) is a warning, not a failure."""
     submits = _successful_submits(run)
     if not submits:
         return None
-    counts: dict[str, int] = {}
+    by_number: dict[str, list[dict]] = {}
     for result in submits:
-        counts[result["confirmation_number"]] = counts.get(result["confirmation_number"], 0) + 1
-    repeated = {k: v for k, v in counts.items() if v > 1}
-    return (not repeated), ("ok" if not repeated else
-                            "; ".join(f"{k} submitted {v} times" for k, v in repeated.items()))
+        by_number.setdefault(result["confirmation_number"], []).append(result)
+    repeated = {k: v for k, v in by_number.items() if len(v) > 1}
+    if not repeated:
+        return True, "ok"
+    detail = "; ".join(f"{k} submitted {len(v)} times" for k, v in repeated.items())
+    if all(r.get("already_submitted") for v in repeated.values() for r in v[1:]):
+        return True, f"{WARNING_PREFIX}{detail} (repeats returned already_submitted)"
+    return False, detail
 
 
 CHECKS = {
@@ -505,7 +517,8 @@ def evaluate(case: dict, run: dict) -> dict[str, dict]:
         result = fn(case, run)
         if result is not None:
             out[name] = {"passed": result[0], "detail": result[1],
-                         "counted": only is None or name in only}
+                         "counted": only is None or name in only,
+                         "warning": result[0] and result[1].startswith(WARNING_PREFIX)}
     return out
 
 

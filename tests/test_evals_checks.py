@@ -168,7 +168,8 @@ def test_final_order_rejects_extra_items():
 
 def test_evaluate_marks_errors_as_failed_runs():
     checks = evaluate({"steps": [{"say": "hi"}]}, run_of(step(), error="timeout at step 1"))
-    assert checks["completed"] == {"passed": False, "detail": "timeout at step 1", "counted": True}
+    assert checks["completed"] == {"passed": False, "detail": "timeout at step 1", "counted": True,
+                                   "warning": False}
 
 
 # -- cases.yaml stays consistent with the menu ----------------------------------------
@@ -296,7 +297,9 @@ def test_submit_at_most_once():
     twice = run_of(step(calls=[call("submit_order", result=SUBMIT_OK)]),
                    step(calls=[call("submit_order", result={**SUBMIT_OK, "already_submitted": True})]))
     passed, detail = check_submit_at_most_once({}, twice)
-    assert not passed and "GW-1045 submitted 2 times" in detail
+    assert passed and detail.startswith("warning: GW-1045 submitted 2 times")
+    no_flag = run_of(step(calls=[call("submit_order", result=SUBMIT_OK), call("submit_order", result=SUBMIT_OK)]))
+    assert not check_submit_at_most_once({}, no_flag)[0]  # a repeat NOT answered as already_submitted
     refused = run_of(step(calls=[call("submit_order", result={"error": {"code": "invalid_arguments"}}),
                                  call("submit_order", result=SUBMIT_OK)]))
     assert check_submit_at_most_once({}, refused)[0]  # a refused attempt is not a submit
@@ -356,7 +359,8 @@ def test_get_order_before_submit():
 def test_only_checks_decide_pass_but_others_are_still_reported():
     case = {"steps": [{"say": "x"}], "only_checks": ["completed"]}
     checks = evaluate(case, run_of(step(agent="backend unavailable")))
-    assert checks["no_leaks"] == {"passed": False, "detail": "spoke: backend_unavailable", "counted": False}
+    assert checks["no_leaks"] == {"passed": False, "detail": "spoke: backend_unavailable", "counted": False,
+                                  "warning": False}
     assert run_passed(checks)
 
 
@@ -375,3 +379,17 @@ def test_asks_to_place_order():
     assert asks_to_place_order("Shall I go ahead and place your order?")
     assert not asks_to_place_order("Order placed! Your confirmation number is GW-1046.")
     assert not asks_to_place_order("Anything else?")
+
+
+def test_leak_check_catches_markdown_and_markup():
+    for bad in ("fried rice?```json\n{}\n```", "rice?\n---\n---", "Anything else?<no speech>"):
+        assert not check_no_leaks({}, run_of(step(agent=bad)))[0], bad
+    assert check_no_leaks({}, run_of(step(agent="Two Cokes - $5.98. Regular or large?")))[0]
+
+
+def test_duplicate_submit_is_reported_as_warning():
+    twice = run_of(step(calls=[call("get_order"), call("submit_order", result=SUBMIT_OK),
+                               call("submit_order", result={**SUBMIT_OK, "already_submitted": True})]))
+    checks = evaluate({"steps": [{"say": "x"}]}, twice)
+    assert checks["submit_at_most_once"]["passed"] and checks["submit_at_most_once"]["warning"]
+    assert run_passed(checks) or not all(c["passed"] for k, c in checks.items() if k != "submit_at_most_once")
