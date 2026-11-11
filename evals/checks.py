@@ -346,10 +346,11 @@ def check_final_order(case: dict, run: dict) -> CheckResult:
     return (not problems), ("ok" if not problems else "; ".join(problems))
 
 
-# "GW-1045", "GW 1045", "G W 1 0 4 5", "confirmation number is 1045"
+# "GW-1045", "GW 1045", "G W 1 0 4 5", "confirmation number is 1045";
+# captures the whole number (a made-up "GW-12345" must not read as GW-1234).
 _SPOKEN_CONFIRMATION = re.compile(
-    r"\bG\s*\.?\s*-?\s*W\b\s*\.?\s*[-#:]?\s*((?:\d[\s-]?){4})"
-    r"|confirmation number(?: is)?\s*:?\s*((?:\d[\s-]?){4})",
+    r"\bG\s*\.?\s*-?\s*W\b\s*\.?\s*[-#:]?\s*((?:\d[\s-]?){3,}\d)(?!\d)"
+    r"|confirmation number(?: is)?\s*:?\s*((?:\d[\s-]?){3,}\d)(?!\d)",
     re.IGNORECASE,
 )
 

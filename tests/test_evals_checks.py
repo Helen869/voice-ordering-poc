@@ -296,3 +296,9 @@ def test_submit_at_most_once():
     refused = run_of(step(calls=[call("submit_order", result={"error": {"code": "invalid_arguments"}}),
                                  call("submit_order", result=SUBMIT_OK)]))
     assert check_submit_at_most_once({}, refused)[0]  # a refused attempt is not a submit
+
+
+def test_longer_made_up_number_is_reported_whole():
+    r = ev_run(returned(), said("Your confirmation number is GW-12345."))
+    passed, detail = check_confirmation_numbers({}, r)
+    assert not passed and "spoke GW-12345" in detail
