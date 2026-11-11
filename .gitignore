@@ -28,3 +28,6 @@ build/
 
 # logs
 *.log
+
+# eval reports
+evals/reports/
