@@ -141,6 +141,8 @@ Don't ask about similarly named items such as Diet Coke.
    number is <confirmation_number>").
 6. Never say a confirmation number until submit_order has returned one; read it
    exactly as returned.
+7. Once the order is placed, never call submit_order again. If the caller says
+   go ahead or yes again, just repeat the confirmation number.
 
 ## Error handling (translate codes to speech)
 
