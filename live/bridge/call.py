@@ -215,12 +215,20 @@ class CallBridge:
         self._model_idle = True
         self.stats: Optional[PumpStats] = None  # set by --debug
         self._pending_tools = 0  # queued or running function calls
+        self.tool_responses_sent = 0  # tool responses sent to the model so far
+        self._responses_answered = 0  # ...of which the model has replied to
         # Confirmation-number guard
         self._confirmation: Optional[str] = None  # from a successful submit_order
         self._turn_text = ""  # agent transcript of the current turn
         self._turn_scanned = 0  # offset up to which numbers were checked
         self._early: list[str] = []  # numbers spoken before any submit result
         self._corrected: set[str] = set()  # wrong numbers already noted
+
+    @property
+    def awaiting_reply(self) -> bool:
+        """A tool response was sent and the model has produced nothing since
+        (no speech, no new function call). Its reply is still to come."""
+        return self.tool_responses_sent > self._responses_answered
 
     @property
     def tools_idle(self) -> bool:
@@ -240,6 +248,8 @@ class CallBridge:
             upd = msg.session_resumption_update
             if upd.resumable and upd.new_handle:
                 self.resumption_handle = upd.new_handle
+        if getattr(msg, "tool_call", None) or getattr(getattr(msg, "server_content", None), "model_turn", None):
+            self._responses_answered = self.tool_responses_sent  # model output = it moved on
         if getattr(msg, "tool_call", None):
             batch = list(msg.tool_call.function_calls or [])
             if batch:  # one message = one batch = one tool response
@@ -313,6 +323,7 @@ class CallBridge:
             live.append({"id": fc.id, "name": fc.name, "response": result})
         if live:
             await self._session.send_tool_response(function_responses=live)
+            self.tool_responses_sent += 1
         for number in submits.values():
             self._set_confirmation(number)
         self._sent_submits.update(submits)

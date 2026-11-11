@@ -473,3 +473,33 @@ def test_isolated_quota_error_is_not_scored(monkeypatch, tmp_path, capsys):
     assert len(calls) == 6 and code == 0  # one lost run; the other 5 passed
     out = capsys.readouterr().out
     assert "not scored, rate-limit/quota errors (1)" in out
+
+
+def test_turn_not_done_until_model_answers_the_tool_response():
+    """Regression: turn_complete arrived with the tool_call; the model's spoken
+    reply to the tool response came > settle seconds later and was lost."""
+    pytest.importorskip("yaml")
+    from evals.run import _wait_turn_done
+
+    class Bridge:
+        tools_idle = True
+        awaiting_reply = False
+
+    async def go():
+        bridge, events = Bridge(), asyncio.Queue()
+        events.put_nowait("activity")       # tool_call
+        events.put_nowait("turn_complete")  # arrives with it
+        bridge.awaiting_reply = True        # bridge answered; model hasn't replied yet
+
+        async def late_reply():             # model speaks after 3x the settle time
+            await asyncio.sleep(0.3)
+            bridge.awaiting_reply = False
+            events.put_nowait("activity")
+            events.put_nowait("turn_complete")
+
+        task = asyncio.create_task(late_reply())
+        await _wait_turn_done(events, bridge, timeout=3, settle=0.1)
+        await task
+        return events.qsize()
+
+    assert asyncio.run(go()) == 0  # waited for (and consumed) the late reply

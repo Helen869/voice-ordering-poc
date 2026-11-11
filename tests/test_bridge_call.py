@@ -589,3 +589,23 @@ def test_number_spoken_with_no_order_placed_gets_no_number_note():
 
 def test_live_config_always_has_output_transcription():
     assert build_live_config(None)["output_audio_transcription"] == {}
+
+
+def test_awaiting_reply_until_model_output_after_tool_response():
+    async def go():
+        session = FakeSession()
+        bridge = CallBridge(FakeRouter(result={"subtotal": 1}))
+        bridge.attach(session)
+        worker = asyncio.create_task(bridge.run_tools())
+        states = [bridge.awaiting_reply]
+        await bridge.on_message(tool_call(("1", "search_menu", {})))
+        await drain(bridge)
+        states.append(bridge.awaiting_reply)          # response sent, no reply yet
+        await bridge.on_message(content(turn_complete=True))
+        states.append(bridge.awaiting_reply)          # turn_complete is not a reply
+        await bridge.on_message(content(model_turn=NS(parts=[])))
+        states.append(bridge.awaiting_reply)          # model speaks: answered
+        worker.cancel()
+        return states
+
+    assert asyncio.run(go()) == [False, True, True, False]

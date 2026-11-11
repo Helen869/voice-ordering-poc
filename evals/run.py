@@ -174,8 +174,12 @@ async def _wait_for_activity(events: asyncio.Queue, timeout: float) -> None:
 
 
 async def _wait_turn_done(events: asyncio.Queue, bridge: CallBridge, timeout: float, settle: float) -> None:
-    """Until a turn completes with no function call pending and nothing follows
-    within ``settle`` seconds (late turns, e.g. after a System note, are kept)."""
+    """Until a turn completes with no function call pending, the model has
+    answered every tool response sent so far, and nothing follows within
+    ``settle`` seconds (late turns, e.g. after a System note, are kept).
+
+    A turn_complete can arrive together with a tool_call, before the model
+    has spoken its reply to the tool response; that turn is not done."""
     deadline = time.monotonic() + timeout
     completed = False  # last event was turn_complete
     while True:
@@ -185,9 +189,12 @@ async def _wait_turn_done(events: asyncio.Queue, bridge: CallBridge, timeout: fl
         try:
             event = await _next_event(events, min(settle, remaining) if completed else remaining)
         except asyncio.TimeoutError:
-            if completed and bridge.tools_idle:
+            # events.empty(): the reader updates the bridge before queueing the
+            # event, so "answered" can be visible while its event is still queued.
+            if (completed and events.empty() and bridge.tools_idle
+                    and not getattr(bridge, "awaiting_reply", False)):
                 return  # quiet after a completed turn: done
-            continue  # still waiting (a function call is running, or overall deadline)
+            continue  # still waiting: a call is running, or its response is unanswered
         completed = event == "turn_complete"
 
 
