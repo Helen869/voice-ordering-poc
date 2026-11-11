@@ -393,3 +393,27 @@ def test_duplicate_submit_is_reported_as_warning():
     checks = evaluate({"steps": [{"say": "x"}]}, twice)
     assert checks["submit_at_most_once"]["passed"] and checks["submit_at_most_once"]["warning"]
     assert run_passed(checks) or not all(c["passed"] for k, c in checks.items() if k != "submit_at_most_once")
+
+
+# -- eval API key selection ------------------------------------------------------
+def test_eval_key_preferred_then_main_key():
+    pytest.importorskip("yaml")
+    from evals.run import key_suffix, select_api_key
+
+    both = {"GEMINI_EVAL_API_KEY": "eval-key-AAAA", "GEMINI_API_KEY": "main-key-BBBB"}
+    assert select_api_key(both) == ("GEMINI_EVAL_API_KEY", "eval-key-AAAA")
+    assert select_api_key({"GEMINI_EVAL_API_KEY": "  ", "GEMINI_API_KEY": "main-key-BBBB"}) == \
+        ("GEMINI_API_KEY", "main-key-BBBB")  # empty value in .env counts as unset
+    assert select_api_key({}) is None
+    assert key_suffix("eval-key-AAAA") == "...AAAA"
+    assert "AAAA" not in key_suffix("AAAA")  # never echo a whole short key
+
+
+def test_concurrency_must_be_positive():
+    pytest.importorskip("yaml")
+    from evals.run import parse_args
+
+    assert parse_args(["--concurrency", "1"]).concurrency == 1
+    assert parse_args([]).concurrency == 3
+    with pytest.raises(SystemExit):
+        parse_args(["--concurrency", "0"])

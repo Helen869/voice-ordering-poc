@@ -387,6 +387,23 @@ def load_cases(path: Path, only: Optional[str]) -> list[dict]:
     return cases
 
 
+# Evals use their own key when set (e.g. a separate free-tier key for synthetic data).
+EVAL_KEY_VARS = ("GEMINI_EVAL_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
+
+
+def select_api_key(env: Optional[dict] = None) -> Optional[tuple[str, str]]:
+    """(variable name, key) of the first non-empty key in EVAL_KEY_VARS."""
+    env = os.environ if env is None else env
+    for name in EVAL_KEY_VARS:
+        if (env.get(name) or "").strip():
+            return name, env[name].strip()
+    return None
+
+
+def key_suffix(key: str) -> str:
+    return f"...{key[-4:]}" if len(key) >= 8 else "...(short key)"
+
+
 async def preflight(client: Any, model: str) -> None:
     async with client.aio.live.connect(model=model, config={"response_modalities": ["AUDIO"]}):
         pass
@@ -398,10 +415,13 @@ async def main(args: argparse.Namespace) -> int:
     except (OSError, ValueError, KeyError, yaml.YAMLError) as exc:
         print(f"Cannot load cases: {exc}", file=sys.stderr)
         return 2
-    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
-        print("Set GEMINI_API_KEY (or GOOGLE_API_KEY), e.g. in .env.", file=sys.stderr)
+    selected = select_api_key()
+    if selected is None:
+        print("Set GEMINI_EVAL_API_KEY or GEMINI_API_KEY, e.g. in .env.", file=sys.stderr)
         return 2
-    client = make_live_client(args.api_version)
+    key_var, api_key = selected
+    print(f"API key: {key_var} ({key_suffix(api_key)})")
+    client = make_live_client(args.api_version, api_key=api_key)
     try:
         await preflight(client, args.model)
     except Exception as exc:
@@ -415,6 +435,7 @@ async def main(args: argparse.Namespace) -> int:
     meta = {
         "started_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "model": args.model, "api_version": args.api_version, "language": args.language or "auto",
+        "api_key_var": key_var, "api_key_suffix": key_suffix(api_key), "concurrency": args.concurrency,
         "google_genai": genai.__version__, "runs": args.runs, "threshold": args.threshold,
         "git": git_info(),
     }
@@ -454,7 +475,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="minimum pass rate per case, 0-1 (default 0.8; with 3 runs = 3/3)")
     p.add_argument("--cases", help="comma-separated case ids (default: all)")
     p.add_argument("--cases-file", default=str(CASES_PATH))
-    p.add_argument("--concurrency", type=int, default=3, help="Live sessions at once (default 3)")
+    p.add_argument("--concurrency", type=int, default=3,
+                   help="Live sessions at once (default 3; use 1 on a free-tier key)")
     p.add_argument("--model", default="gemini-3.8-live")
     p.add_argument("--api-version", default=LIVE_API_VERSION)
     p.add_argument("--language", default=DEFAULT_LANGUAGE)
@@ -463,8 +485,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="quiet seconds after a turn before the next caller turn")
     p.add_argument("--verbose", action="store_true", help="show bridge logs (tool calls etc.)")
     args = p.parse_args(argv)
-    if args.runs < 1 or not 0 <= args.threshold <= 1:
-        p.error("--runs must be >= 1 and --threshold between 0 and 1")
+    if args.runs < 1 or args.concurrency < 1 or not 0 <= args.threshold <= 1:
+        p.error("--runs and --concurrency must be >= 1, --threshold between 0 and 1")
     return args
 
 

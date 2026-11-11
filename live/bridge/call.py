@@ -106,9 +106,13 @@ def new_session_id() -> str:
     return f"live-{uuid.uuid4()}"
 
 
-def make_live_client(api_version: str = LIVE_API_VERSION) -> Any:
+def make_live_client(api_version: str = LIVE_API_VERSION, api_key: Optional[str] = None) -> Any:
+    """Live API client. Without ``api_key`` the SDK reads GEMINI_API_KEY /
+    GOOGLE_API_KEY from the environment."""
     from google import genai
 
+    if api_key:
+        return genai.Client(api_key=api_key, http_options={"api_version": api_version})
     return genai.Client(http_options={"api_version": api_version})
 
 
