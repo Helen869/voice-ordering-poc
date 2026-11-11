@@ -50,11 +50,18 @@ paths:
                     example: 3
                   matches:
                     type: array
-                    description: Items with the same shape as get_menu items (id, name, description, category, base_price, available, modifiers).
+                    description: >
+                      Items with the same shape as get_menu items (id, name, description,
+                      category, base_price, available, modifiers) plus exact_match. Exact
+                      name matches come first.
                     items:
                       type: object
                       required: [id, name, description, category, base_price, available, modifiers]
                       properties:
+                        exact_match:
+                          type: boolean
+                          description: True when the query is exactly this item's name (e.g. "coke" -> Coke, not Diet Coke).
+                          example: false
                         id:
                           type: string
                           example: kung-pao-chicken

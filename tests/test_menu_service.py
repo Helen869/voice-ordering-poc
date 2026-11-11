@@ -97,3 +97,29 @@ def test_search_substring_results_unchanged(menu_service):
     assert {i.id for i in menu_service.search_menu("lo mein")} == {"lo-mein"}
     assert {i.id for i in menu_service.search_menu("fried rice")} == {"fried-rice"}
     assert len(menu_service.search_menu("chicken")) > 3
+
+
+# -- exact name matches rank first ------------------------------------------------------
+@pytest.mark.parametrize("query,first", [
+    ("coke", "coke"),
+    ("Coke", "coke"),
+    ("diet coke", "diet-coke"),
+    ("General Tso's Chicken", "general-tsos-chicken"),
+    ("general tsos chicken", "general-tsos-chicken"),
+])
+def test_exact_name_match_ranks_first(menu_service, query, first):
+    results = menu_service.search_menu(query)
+    assert results[0].id == first
+    assert menu_service.is_exact_match(results[0], query)
+    assert not any(menu_service.is_exact_match(i, query) for i in results[1:])
+
+
+def test_coke_query_still_lists_diet_coke_but_not_as_exact(menu_service):
+    results = menu_service.search_menu("coke")
+    assert [i.id for i in results] == ["coke", "diet-coke"]
+    assert not menu_service.is_exact_match(results[1], "coke")
+
+
+def test_partial_name_is_not_exact(menu_service):
+    assert not any(menu_service.is_exact_match(i, "chicken") for i in menu_service.search_menu("chicken"))
+    assert not menu_service.is_exact_match(menu_service.get_item("lo-mein"), "beef lo mein")

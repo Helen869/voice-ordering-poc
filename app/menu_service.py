@@ -27,6 +27,10 @@ def _tokens(text: str) -> set:
     return set(re.findall(r"[a-z0-9]+", re.sub(r"['’]", "", text.lower())))
 
 
+def _name_key(text: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", re.sub(r"['’]", "", text.lower())))
+
+
 def _name_with_options_match(item: MenuItem, query_tokens: set) -> bool:
     name_tokens = _tokens(item.name)
     if not name_tokens or not name_tokens <= query_tokens:
@@ -78,7 +82,19 @@ class MenuService:
             parts.extend(option.name for option in modifier.options)
         return " ".join(parts).lower()
 
+    def is_exact_match(self, item: MenuItem, query: str) -> bool:
+        """The query IS the item's name (case, punctuation and apostrophes
+        ignored): "coke" is Coke, not Diet Coke; "general tsos chicken" is
+        General Tso's Chicken."""
+        return _name_key(item.name) == _name_key(query)
+
     def search_menu(self, query: str) -> List[MenuItem]:
+        """Search results with exact name matches first (stable otherwise)."""
+        matches = self._search(query)
+        exact = [item for item in matches if self.is_exact_match(item, query)]
+        return exact + [item for item in matches if item not in exact]
+
+    def _search(self, query: str) -> List[MenuItem]:
         """Case-insensitive substring search over the item's search text.
 
         Falls back to difflib.get_close_matches against individual search
