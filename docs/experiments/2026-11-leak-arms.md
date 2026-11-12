@@ -60,7 +60,7 @@ no-progress watchdog) as a safety net. The root cause is not fixed.
 | Leak turns (of 2 per run) | 4 | 6 | 4 | 3 |
 | … voiced | 1 | 2 | 2 | 0 |
 | Leaks with invented prices | 1 (unvoiced) | 1 (unvoiced) | 1 (voiced) | 0 |
-| Other failures | 1 stalled turn [^stall], 1 server error (1011) | – | 1 guessed modifier | 1 silent turn [^silent] |
+| Other failures | 1 stalled turn [^stall], 1 server error (1011) | – | 1 guessed modifier | 1 silent turn [^silent], 1 39 s pause mid-turn [^pause] |
 | First-audio latency, median per batch | 1.17 / 1.11 / 1.14 / 1.20 s | 1.11 / 1.09 / 1.11 / 1.19 s | 1.11 s | 1.17 / 1.08 / 1.14 / 1.09 s |
 | p90 per batch | 1.55 / 1.45 / 1.47 / 2.25 s | 1.64 / 1.39 / 1.47 / 1.80 s | 1.72 s | 1.66 / 1.42 / 1.66 / 1.39 s |
 
@@ -71,6 +71,10 @@ no-progress watchdog) as a safety net. The root cause is not fixed.
     turn. The new no-progress watchdog covers this case.
 [^silent]: The turn contained only a "System note" self-note: no audio and
     no function call. A caller would have heard silence.
+[^pause]: The agent said "Sure thing!", went silent for 39 s, then asked the
+    question. The run passed, because no check looks for silence mid-turn
+    (a gap in the checks). The no-progress watchdog would step in after
+    about 8 s.
 
 **Significance:** none of the differences are statistically significant. For
 runs failing `no_leaks`, control vs A is 3/200 vs 5/200 (Fisher exact
