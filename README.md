@@ -289,6 +289,13 @@ Explicitly out of scope for this experiment:
 - **No CI/CD pipeline** (deploy via the `gcloud` commands above).
 - Per-line quantity cap of 20 (guards against absurd voice input).
 
+## Backlog
+
+- **Send the confirmation number by SMS** in production, in addition to reading
+  it aloud. Speech is not a reliable channel for an ID: in Live API evals the
+  model has occasionally spoken a wrong number before correcting itself (the
+  bridge now detects this and sends a correction note), and callers can mishear.
+
 ## Review documents
 
 Self-review performed before pushing (see [`review/`](review/)):

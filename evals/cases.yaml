@@ -1,0 +1,213 @@
+# Layer-1 eval cases for the Live agent: caller turns are sent as text.
+#
+# Case fields:
+#   id, description
+#   steps:          caller turns, in order. Each step:
+#     say:            caller text
+#     explicit_yes:   true on the turn that explicitly confirms the order
+#     barge_in:       true = send this turn as soon as the agent starts answering
+#                     the previous one (first audio or function call), not after it
+#     backend:        "down" / "up" before this turn
+#     forbid_calls:   function names that must not be called during this turn
+#     say_all / say_any / say_none: case-insensitive substrings of the agent's reply
+#   expect_calls:   calls that must each appear (any order); args are a subset
+#                   match (modifiers as a dict; q is a substring match)
+#   final:          backend order after the call: state, items (modifiers are a
+#                   subset match), subtotal.
+#   reask_reply:    caller reply (an explicit yes) if, after the scripted turns, the
+#                   agent asks again whether to place the order; at most twice.
+#   only_checks:    checks that decide pass/fail for this case; the others are
+#                   still reported, for information.
+#
+# Always-on checks (where applicable): completed, money_from_tools,
+# no_premature_submit, required_modifiers_from_caller, no_leaks,
+# confirmation_spoken, confirmation_numbers, wrong_number_corrected,
+# submit_at_most_once, get_order_before_submit.
+
+cases:
+  - id: ex1_normal_order
+    description: "Playbook example 1: two egg rolls and a chicken lo mein"
+    steps:
+      - say: "I'd like two egg rolls and a chicken lo mein."
+    expect_calls:
+      - name: update_order
+        args: {action: add, item_id: egg-rolls, quantity: 2}
+      - name: update_order
+        args: {action: add, item_id: lo-mein, modifiers: {protein: chicken}}
+    final:
+      state: draft
+      items:
+        - {item_id: egg-rolls, quantity: 2}
+        - {item_id: lo-mein, quantity: 1, modifiers: {protein: chicken}}
+      subtotal: 15.99
+
+  - id: ex2_missing_required_modifier
+    description: "Playbook example 2: fried rice needs a protein; ask, don't guess"
+    steps:
+      - say: "I want fried rice."
+        forbid_calls: [update_order]
+        say_all: [vegetable, chicken, beef, shrimp]
+      - say: "Shrimp."
+    expect_calls:
+      - name: update_order
+        args: {action: add, item_id: fried-rice, modifiers: {protein: shrimp}}
+    final:
+      state: draft
+      items:
+        - {item_id: fried-rice, quantity: 1, modifiers: {protein: shrimp}}
+      subtotal: 12.49
+
+  - id: ex3_correction
+    description: "Playbook example 3: two Cokes, then actually just one"
+    steps:
+      - say: "Give me two Cokes."
+      - say: "Actually just one."
+    expect_calls:
+      - name: update_order
+        args: {action: add, item_id: coke, quantity: 2}
+    final:
+      state: draft
+      items:
+        - {item_id: coke, quantity: 1}
+      subtotal: 2.99
+
+  - id: ex4_reference_resolution
+    description: "Playbook example 4: size question, then 'make the chicken spicy' is unambiguous"
+    steps:
+      - say: "I want General Tso's chicken and beef lo mein."
+        say_all: [regular, large]
+      - say: "Regular."
+      - say: "Make the chicken spicy."
+    expect_calls:
+      - name: update_order
+        args: {action: add, item_id: general-tsos-chicken, modifiers: {size: regular}}
+      - name: update_order
+        args: {action: add, item_id: lo-mein, modifiers: {protein: beef}}
+      - name: update_order
+        args: {action: update, item_id: general-tsos-chicken, set_modifiers: {spice_level: spicy}}
+    final:
+      state: draft
+      items:
+        - {item_id: general-tsos-chicken, quantity: 1, modifiers: {size: regular, spice_level: spicy}}
+        - {item_id: lo-mein, quantity: 1, modifiers: {protein: beef}}
+      subtotal: 26.98
+
+  - id: ex5_invalid_menu_request
+    description: "Playbook example 5: cheeseburger is not on the menu"
+    steps:
+      - say: "Can I get a cheeseburger?"
+        forbid_calls: [update_order, submit_order]
+    expect_calls:
+      - name: search_menu
+        args: {q: cheeseburger}
+    final:
+      state: draft
+      items: []
+
+  - id: ex6_full_order_confirm_submit
+    description: "Playbook example 6: order, change size, read back, explicit yes, submit"
+    reask_reply: "Yes"
+    steps:
+      - say: "I'll have General Tso's chicken, shrimp fried rice, and two Cokes."
+      - say: "Regular. And make it spicy."
+      - say: "Actually make the General Tso's a large."
+      - say: "That's all."
+        forbid_calls: [submit_order]
+        say_all: ["place the order"]
+      - say: "Yes, place the order."
+        explicit_yes: true
+    expect_calls:
+      - name: update_order
+        args: {action: add, item_id: general-tsos-chicken, modifiers: {size: regular, spice_level: spicy}}
+      - name: update_order
+        args: {action: add, item_id: fried-rice, modifiers: {protein: shrimp}}
+      - name: update_order
+        args: {action: add, item_id: coke, quantity: 2}
+      - name: update_order
+        args: {action: update, item_id: general-tsos-chicken, set_modifiers: {size: large}}
+      - name: get_order
+      - name: submit_order
+    final:
+      state: submitted
+      items:
+        - {item_id: general-tsos-chicken, quantity: 1, modifiers: {size: large, spice_level: spicy}}
+        - {item_id: fried-rice, quantity: 1, modifiers: {protein: shrimp}}
+        - {item_id: coke, quantity: 2}
+      subtotal: 35.46
+
+  - id: barge_in_after_yes
+    description: "Caller talks over the agent right after 'yes'. Passes if the order is submitted after an explicit yes and get_order preceded every submit_order"
+    reask_reply: "Yes"
+    only_checks: [completed, final_order, no_premature_submit, get_order_before_submit]
+    steps:
+      - say: "One Coke please. That's all."
+        forbid_calls: [submit_order]
+      - say: "Yes, place the order."
+        explicit_yes: true
+      - say: "Oh sorry, go ahead."
+        barge_in: true
+    expect_calls:
+      - name: update_order
+        args: {action: add, item_id: coke}
+      - name: submit_order
+    final:
+      state: submitted
+
+  - id: coke_means_regular_coke
+    description: "'Coke' exactly names Coke: add it directly, no question about Diet Coke"
+    steps:
+      - say: "One Coke, please."
+        forbid_calls: [submit_order]
+        say_none: [diet]
+    expect_calls:
+      - name: update_order
+        args: {action: add, item_id: coke, quantity: 1}
+    final:
+      state: draft
+      items:
+        - {item_id: coke, quantity: 1}
+      subtotal: 2.99
+
+  - id: backend_down
+    description: "Backend unreachable mid-call: say the backend_unavailable line, invent nothing"
+    steps:
+      - say: "I'd like a Coke."
+      - say: "And a Sprite too."
+        backend: down
+        say_any: ["trouble reaching our system"]
+    expect_calls:
+      - name: update_order
+        args: {action: add, item_id: coke}
+    final:
+      state: draft
+      items:
+        - {item_id: coke, quantity: 1}
+      subtotal: 2.99
+
+  - id: unknown_item
+    description: "An item that is not on the menu: search, say so, add nothing"
+    steps:
+      - say: "Do you have sushi?"
+        forbid_calls: [update_order, submit_order]
+    expect_calls:
+      - name: search_menu
+        args: {q: sushi}
+    final:
+      state: draft
+      items: []
+
+  - id: unclear_item_never_guess
+    description: "Unclear dish name: ask or confirm a guess; never add or ask quantity/options first"
+    steps:
+      - say: "Can I get two of the older?"
+        forbid_calls: [update_order, submit_order]
+        say_none: ["how many"]
+      - say: "Egg rolls. Two of them."
+    expect_calls:
+      - name: update_order
+        args: {action: add, item_id: egg-rolls, quantity: 2}
+    final:
+      state: draft
+      items:
+        - {item_id: egg-rolls, quantity: 2}
+      subtotal: 3.50

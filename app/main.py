@@ -130,7 +130,10 @@ def search_menu(q: Optional[str] = Query(default=None)):
     return {
         "query": q,
         "match_count": len(matches),
-        "matches": [item.model_dump() for item in matches],
+        "matches": [
+            {**item.model_dump(), "exact_match": menu_service.is_exact_match(item, q)}
+            for item in matches
+        ],
     }
 
 

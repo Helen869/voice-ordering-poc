@@ -104,3 +104,8 @@ def test_submit_twice_idempotent_flag(client):
     second = client.post("/tools/order/submit", json={"session_id": session}).json()
     assert second["already_submitted"] is True
     assert second["confirmation_number"] == first["confirmation_number"]
+
+
+def test_search_marks_exact_match_and_ranks_it_first(client):
+    body = client.get("/tools/menu/search", params={"q": "Coke"}).json()
+    assert [(m["id"], m["exact_match"]) for m in body["matches"]] == [("coke", True), ("diet-coke", False)]

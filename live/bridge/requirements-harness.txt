@@ -1,0 +1,3 @@
+-r requirements.txt
+sounddevice>=0.4
+python-dotenv>=1.0

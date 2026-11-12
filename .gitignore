@@ -25,3 +25,9 @@ build/
 
 # agent tooling
 .codex/
+
+# logs
+*.log
+
+# eval reports
+evals/reports/

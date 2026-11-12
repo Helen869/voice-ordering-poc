@@ -1,0 +1,76 @@
+[
+  {
+    "name": "get_menu",
+    "description": "Retrieves the complete Golden Wok menu: every item with its id, name, description, category, base_price, required/optional modifiers, and availability. Call this when the customer asks what is available, asks for recommendations, or when you need to check whether an item, size, or modifier exists before quoting it. NEVER state a menu item, price, size, modifier, or availability from memory or from the conversation - always read it from this tool's response. Prices here are authoritative; the agent must never calculate or invent prices."
+  },
+  {
+    "name": "search_menu",
+    "description": "Searches the menu for items matching a keyword (case-insensitive, fuzzy). Call this whenever the customer names a dish you have not confirmed is on the menu, or asks \"Do you have X?\", \"What chicken dishes do you have?\", or \"How much is the Y?\". If the customer names something that returns no matches, politely tell them it is not available - NEVER invent the item, a substitute price, or a \"closest thing\" price from memory. Use the returned item ids for subsequent update_order calls. Use get_menu instead when the customer asks for the full menu or a whole category overview.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "q": {
+          "type": "string",
+          "description": "Search keyword or phrase from the customer's speech, e.g. \"chicken\", \"beef noodles\", \"cheeseburger\". Required - the call fails without it."
+        }
+      },
+      "required": ["q"]
+    }
+  },
+  {
+    "name": "update_order",
+    "description": "Changes the customer's order. Call this for every add, removal, quantity change, or modifier change the customer requests. The backend is the authority: it validates that the item exists and is available, that the quantity is valid, that modifiers are allowed and options are valid, and it computes unit_price and line_total (including modifier price deltas). The agent must never calculate prices itself - always read the returned subtotal. Error responses use {\"error\": {\"code\", \"message\", \"details\"}}; translate codes into plain speech for the customer (never read raw codes aloud). Common codes: item_not_found (no such menu item - offer what the menu actually has), item_unavailable, invalid_quantity, unknown_modifier, invalid_modifier_option, missing_required_modifiers (ask the customer for the listed options), ambiguous_item_reference (details.candidates lists the matching order lines - ask the customer which one they mean), line_not_found, order_locked.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["add", "remove", "update"],
+          "description": "add: put a new line on the order (quantity defaults to 1). remove: delete matching order line(s) for item_id entirely. update: change quantity and/or modifiers of the existing line for item_id."
+        },
+        "item_id": {
+          "type": "string",
+          "description": "Exact item id from get_menu/search_menu (never a spoken name). For ambiguous spoken references, resolve to an id using conversation context and get_order first; if two lines could match, ask the customer which one instead of guessing."
+        },
+        "quantity": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "For add: how many (default 1). For update: the NEW total quantity (not a delta) - e.g. customer says \"actually make that one egg roll\" after ordering two => update quantity 1. For remove: how many to take off (omit to remove the whole line)."
+        },
+        "modifiers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string", "description": "Modifier name, e.g. size, protein, spice_level." },
+              "value": { "type": "string", "description": "Chosen option name, e.g. regular, chicken, spicy." }
+            },
+            "required": ["name", "value"]
+          },
+          "description": "For add: one {name, value} entry per modifier (modifier name -> chosen option name), e.g. [{\"name\": \"size\", \"value\": \"regular\"}, {\"name\": \"spice_level\", \"value\": \"spicy\"}]. Required modifiers MUST be included; optional ones may be omitted (defaults apply). IMPORTANT inheritance rule: if modifiers are omitted on add and exactly ONE order line already exists for this item_id, the new line inherits that line's modifiers. If none or more than one exist and required modifiers are missing, the backend returns missing_required_modifiers - ask the customer for the options."
+        },
+        "set_modifiers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string", "description": "Modifier name, e.g. size, protein, spice_level." },
+              "value": { "type": "string", "description": "Chosen option name, e.g. regular, chicken, spicy." }
+            },
+            "required": ["name", "value"]
+          },
+          "description": "For update only: modifier overrides merged over the line's current modifiers. You may pass just the changed modifier (e.g. [{\"name\": \"spice_level\", \"value\": \"spicy\"}]) - unchanged modifiers such as a required size are preserved automatically."
+        }
+      },
+      "required": ["action", "item_id"]
+    }
+  },
+  {
+    "name": "get_order",
+    "description": "Returns the customer's current order: every line with item_id, name, quantity, resolved modifiers, backend-calculated unit_price and line_total, plus item_count and subtotal. Call this before reading the order back to the customer, before quoting any total, before asking for confirmation, and whenever you need to resolve an ambiguous reference (\"make the chicken spicy\", \"another one\", \"that\") against what is actually on the order. If nothing has been ordered yet this returns an empty draft order - treat that as \"nothing ordered yet\". The subtotal here is the ONLY number you may quote as the order total; never compute it yourself."
+  },
+  {
+    "name": "submit_order",
+    "description": "WARNING: Call this ONLY after the customer has explicitly confirmed (\"Yes, place the order\", \"Yes, that's right\", or equivalent). Never call it after a vague \"that's all\" or \"okay\" - those mean \"read the summary back to me\", not \"submit\". The flow is: get_order -> read back a concise summary (items, quantities, key modifiers, subtotal) -> ask \"Would you like me to place the order?\" -> on explicit yes, call submit_order. If the customer changes anything during confirmation, update the order with update_order, re-fetch with get_order, re-read the summary, and ask for confirmation again. Submitting an empty order returns 422 empty_order. Calling submit twice is idempotent: the second call returns the same summary with already_submitted: true. On success, read the confirmation_number back to the customer."
+  }
+]

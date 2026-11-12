@@ -1,0 +1,4 @@
+# Eval-only dependencies (python -m evals.run).
+-r ../live/bridge/requirements.txt
+PyYAML>=6.0
+python-dotenv>=1.0
