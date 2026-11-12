@@ -472,7 +472,7 @@ def test_isolated_quota_error_is_not_scored(monkeypatch, tmp_path, capsys):
     code, calls = _fake_main(monkeypatch, tmp_path, [None, "handshake HTTP 429: <empty>"])
     assert len(calls) == 6 and code == 0  # one lost run; the other 5 passed
     out = capsys.readouterr().out
-    assert "not scored, rate-limit/quota errors (1)" in out
+    assert "not scored, infrastructure errors (quota / machine sleep) (1)" in out
 
 
 def test_turn_not_done_until_model_answers_the_tool_response():
@@ -577,3 +577,22 @@ def test_new_heuristic_checks_never_decide_pass_fail():
     for name in INFO_CHECKS & set(checks):
         assert checks[name]["counted"] is False
     assert not checks["unordered_item_confirmed"]["passed"] and run_passed(checks)
+
+
+# -- per-session timeout / machine sleep ---------------------------------------------------
+def test_sleep_runs_are_not_scored_and_do_not_stop_the_run(monkeypatch, tmp_path, capsys):
+    from evals.run import SLEEP_PREFIX, is_sleep_error
+
+    sleep = f"{SLEEP_PREFIX} run took 12000s, session timeout is 300s (was: session timeout after 300s)"
+    assert is_sleep_error(sleep) and not is_sleep_error("session timeout after 300s")
+    code, calls = _fake_main(monkeypatch, tmp_path, [sleep, sleep, sleep])
+    assert len(calls) == 6 and code == 0   # three sleeps in a row: not a quota stop, not scored
+    assert "SLEEP" in capsys.readouterr().out
+
+
+def test_session_timeout_option():
+    pytest.importorskip("yaml")
+    from evals.run import parse_args
+
+    assert parse_args([]).session_timeout == 300
+    assert parse_args(["--session-timeout", "90"]).session_timeout == 90

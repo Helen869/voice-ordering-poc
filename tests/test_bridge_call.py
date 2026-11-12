@@ -609,3 +609,162 @@ def test_awaiting_reply_until_model_output_after_tool_response():
         return states
 
     assert asyncio.run(go()) == [False, True, True, False]
+
+
+# -- audio-cut guard ----------------------------------------------------------------
+from live.bridge.call import (
+    MAX_REANSWERS_PER_CALL,
+    REANSWER_NOTE,
+    UNANSWERED_QUESTION_ERROR,
+)
+
+
+def spoken(text, audio=None, turn_complete=False):
+    """One server message: transcript chunk, optional audio, optional turn end."""
+    parts = [NS(inline_data=NS(data=audio), text=None)] if audio else []
+    return NS(server_content=NS(model_turn=NS(parts=parts) if audio else None, turn_complete=turn_complete,
+                                interrupted=False, output_transcription=NS(text=text) if text else None,
+                                input_transcription=None),
+              tool_call=None, tool_call_cancellation=None, session_resumption_update=None, go_away=None)
+
+
+def test_leak_marker_mutes_rest_of_turn_and_asks_for_a_reanswer():
+    async def go():
+        session = FakeSession()
+        bridge = CallBridge(FakeRouter())
+        bridge.attach(session)
+        await bridge.on_message(spoken("Which protein would you like?"))
+        before = bridge.audio_muted
+        await bridge.on_message(spoken(" ```python df.sum()"))
+        cut = (bridge.audio_muted, bridge.take_clear_request(), bridge.take_clear_request())
+        await bridge.on_message(spoken(" more reasoning"))      # stays muted, no second cut
+        await bridge.on_message(content(turn_complete=True))
+        return before, cut, bridge.audio_muted, bridge.audio_cuts, session.texts
+
+    before, cut, after, cuts, texts = asyncio.run(go())
+    assert before is False
+    assert cut == (True, True, False)       # muted; playback cleared exactly once
+    assert after is False and cuts == 1     # next turn (the re-answer) is heard again
+    assert texts == [REANSWER_NOTE]
+
+
+def test_normal_replies_are_never_cut():
+    async def go():
+        bridge = CallBridge(FakeRouter())
+        bridge.attach(FakeSession())
+        for t in ("Got it - two egg rolls, $3.50. ", "Regular or large? ", "Your number is GW-1046. Thanks!"):
+            await bridge.on_message(spoken(t))
+        return bridge.audio_cuts
+
+    assert asyncio.run(go()) == 0
+
+
+def test_reanswers_are_capped_per_call():
+    async def go():
+        session = FakeSession()
+        bridge = CallBridge(FakeRouter())
+        bridge.attach(session)
+        for _ in range(MAX_REANSWERS_PER_CALL + 1):
+            await bridge.on_message(spoken("<context>{}</context>", turn_complete=True))
+        return bridge.audio_cuts, session.texts
+
+    cuts, texts = asyncio.run(go())
+    assert cuts == MAX_REANSWERS_PER_CALL + 1
+    assert texts == [REANSWER_NOTE] * MAX_REANSWERS_PER_CALL
+
+
+def test_pump_does_not_play_audio_after_a_leak_marker():
+    class ClearingAudio(ScriptedAudio):
+        def __init__(self):
+            super().__init__()
+            self.clears = 0
+
+        async def clear(self):
+            self.clears += 1
+
+    async def go():
+        session = ScriptedSession([
+            spoken("Which protein?", audio=b"A1"),
+            spoken(" ```python", audio=b"LEAK1"),        # marker: this message's audio is cut too
+            spoken(" df.sum() means", audio=b"LEAK2"),
+            spoken(None, audio=b"LEAK3", turn_complete=True),
+            live_msg(go_away=True),
+        ])
+        audio = ClearingAudio()
+        bridge = CallBridge(FakeRouter())
+        await bridge._pump(session, audio)
+        return audio
+
+    audio = asyncio.run(go())
+    assert audio.played == [b"A1"]
+    assert audio.clears == 1
+
+
+# -- guessed-answer guard -------------------------------------------------------------
+ADD_SHRIMP = ("u1", "update_order", {"action": "add", "item_id": "fried-rice",
+                                     "modifiers": [{"name": "protein", "value": "shrimp"}]})
+
+
+def test_add_after_unanswered_question_is_blocked():
+    async def go():
+        session, router = FakeSession(), FakeRouter(result={"subtotal": 12.49})
+        bridge = CallBridge(router)
+        bridge.attach(session)
+        worker = asyncio.create_task(bridge.run_tools())
+        await bridge.on_message(spoken("Would you like vegetable, chicken, beef, or shrimp?"))
+        await bridge.on_message(tool_call(ADD_SHRIMP))          # the model answers for the caller
+        await drain(bridge)
+        worker.cancel()
+        return router.calls, session.tool_responses, bridge.guesses_blocked
+
+    calls, responses, blocked = asyncio.run(go())
+    assert calls == []                                          # never reached the backend
+    assert responses[0]["response"]["error"]["code"] == "invalid_arguments"
+    assert responses[0]["response"]["error"]["message"] == UNANSWERED_QUESTION_ERROR
+    assert blocked == 1
+
+
+def test_add_allowed_once_the_caller_has_answered():
+    async def go(answer):
+        router = FakeRouter(result={"subtotal": 12.49})
+        bridge = CallBridge(router)
+        bridge.attach(FakeSession())
+        worker = asyncio.create_task(bridge.run_tools())
+        await bridge.on_message(spoken("Which protein would you like?"))
+        await answer(bridge)
+        await bridge.on_message(tool_call(ADD_SHRIMP))
+        await drain(bridge)
+        worker.cancel()
+        return [c[0] for c in router.calls]
+
+    async def text_mode(bridge):
+        bridge.caller_input()
+
+    async def audio_mode(bridge):  # input transcript of the caller's speech
+        await bridge.on_message(msg(server_content=NS(model_turn=None, turn_complete=False, interrupted=False,
+                                                      output_transcription=None,
+                                                      input_transcription=NS(text="Shrimp."))))
+
+    assert asyncio.run(go(text_mode)) == ["update_order"]
+    assert asyncio.run(go(audio_mode)) == ["update_order"]
+
+
+def test_submit_after_unanswered_question_is_blocked_and_statements_do_not_block():
+    async def go():
+        router = FakeRouter()
+        bridge = CallBridge(router)
+        bridge.attach(FakeSession())
+        worker = asyncio.create_task(bridge.run_tools())
+        await bridge.on_message(spoken("Got it, two egg rolls."))           # no question
+        await bridge.on_message(tool_call(("g1", "get_order", {})))
+        await bridge.on_message(spoken("Would you like me to place the order?"))
+        await bridge.on_message(tool_call(("s1", "submit_order", {})))      # no yes yet
+        await drain(bridge)
+        worker.cancel()
+        return [c[0] for c in router.calls], bridge.guesses_blocked
+
+    assert asyncio.run(go()) == (["get_order"], 1)
+
+
+def test_live_config_has_caller_transcription_for_the_guard():
+    assert build_live_config(None)["input_audio_transcription"] == {}

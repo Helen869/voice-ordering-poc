@@ -33,8 +33,7 @@ from pathlib import Path
 from typing import Optional
 
 BYTES_PER_SECOND = 24_000 * 2
-# JSON braces, code fence, markup tag, markdown rule, bold, or a bullet line ("*   *Step 1").
-LEAK_MARKER = re.compile(r"[{}]|```|<[a-z][a-z ]*>|^\s*-{3,}\s*$|\*\*|^\s*\*\s", re.IGNORECASE | re.MULTILINE)
+from live.bridge.call import LEAK_MARKER  # the same markers the bridge's audio cut uses
 VOICED_MIN_EXCESS_S = 2.0
 
 
@@ -51,7 +50,10 @@ def turn_records(run: dict) -> list[dict]:
                 text += e["text"]
                 if marker_seq is None and LEAK_MARKER.search(text):
                     marker_seq = e["seq"]
-        cut = sum(e["bytes"] for e in audio if marker_seq is not None and e["seq"] > marker_seq)
+        if any("forwarded" in e for e in audio):  # bridge guard active: real cuts
+            cut = sum(e["bytes"] for e in audio if e.get("forwarded") is False)
+        else:  # older reports: simulate a cut after the first marker chunk
+            cut = sum(e["bytes"] for e in audio if marker_seq is not None and e["seq"] > marker_seq)
         out.append({
             "step": index,
             "leak": marker_seq is not None,

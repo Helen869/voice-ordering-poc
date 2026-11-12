@@ -142,12 +142,6 @@ async def _read_loop(session: Any, bridge: CallBridge, state: TurnState, events:
                 if sc and sc.output_transcription and sc.output_transcription.text:
                     state.agent[state.step] += sc.output_transcription.text
                     log.add("agent_text", state.step, text=sc.output_transcription.text)
-                if sc and sc.model_turn:
-                    for part in sc.model_turn.parts or []:
-                        if part.inline_data and part.inline_data.data:  # 24 kHz 16-bit PCM
-                            log.add("audio", state.step, bytes=len(part.inline_data.data))
-                        if part.text:  # not speech: logged apart, never scored as speech
-                            log.add("model_text", state.step, text=part.text, thought=bool(part.thought))
                 if msg.tool_call:
                     fcs = msg.tool_call.function_calls or []
                     log.add("tool_call", state.step, ids=[f.id for f in fcs], names=[f.name for f in fcs])
@@ -158,7 +152,19 @@ async def _read_loop(session: Any, bridge: CallBridge, state: TurnState, events:
                 if getattr(msg, "usage_metadata", None):  # token usage, for cost estimates
                     log.add("usage", state.step,
                             usage=msg.usage_metadata.model_dump(exclude_none=True, mode="json"))
+                # Same order as the live pump: the bridge sees this message's
+                # transcript before its audio would be played, so an audio cut
+                # (leak marker) also stops the audio in this message.
+                muted = bridge.audio_muted
                 await bridge.on_message(msg)
+                muted = muted or bridge.audio_muted
+                if sc and sc.model_turn:
+                    for part in sc.model_turn.parts or []:
+                        if part.inline_data and part.inline_data.data:  # 24 kHz 16-bit PCM
+                            log.add("audio", state.step, bytes=len(part.inline_data.data),
+                                    forwarded=not muted)
+                        if part.text:  # not speech: logged apart, never scored as speech
+                            log.add("model_text", state.step, text=part.text, thought=bool(part.thought))
                 if sc and sc.turn_complete:
                     events.put_nowait("turn_complete")
                 elif msg.tool_call or (sc and sc.model_turn):
@@ -238,6 +244,7 @@ async def run_case(client: Any, case: dict, args: argparse.Namespace) -> dict:
     log = EventLog()
     recorder = RecordingRouter(ToolRouter(backend, session_id), log)
     bridge = CallBridge(recorder, language=args.language or None)
+    bridge.on_guard_event = lambda kind, **fields: log.add(kind, state.step, **fields)
     state = TurnState(len(steps))
     events: asyncio.Queue = asyncio.Queue()
     config = build_live_config(None, {"output_audio_transcription": {}}, args.language or None)
@@ -254,55 +261,64 @@ async def run_case(client: Any, case: dict, args: argparse.Namespace) -> dict:
             backend.down = spec["backend"] == "down"
         state.step = recorder.step = index
         log.add("caller", index, text=spec["say"])
+        bridge.caller_input()  # text mode: the bridge has no input transcript
 
     try:
-        async with client.aio.live.connect(model=args.model, config=config) as session:
-            bridge.attach(LoggingSession(session, log, state))  # bridge sends only
-            worker = asyncio.create_task(bridge.run_tools())
-            reader = asyncio.create_task(_read_loop(session, bridge, state, events, log))
-            try:
-                i = 0
-                while i < len(steps):
-                    begin(i)
-                    await session.send_realtime_input(text=steps[i]["say"])
-                    if i + 1 < len(steps) and steps[i + 1].get("barge_in"):
-                        await _wait_for_activity(events, args.step_timeout)
-                        i += 1
+        async with asyncio.timeout(args.session_timeout):
+            async with client.aio.live.connect(model=args.model, config=config) as session:
+                bridge.attach(LoggingSession(session, log, state))  # bridge sends only
+                worker = asyncio.create_task(bridge.run_tools())
+                reader = asyncio.create_task(_read_loop(session, bridge, state, events, log))
+                try:
+                    i = 0
+                    while i < len(steps):
                         begin(i)
                         await session.send_realtime_input(text=steps[i]["say"])
-                    try:
-                        await _wait_turn_done(events, bridge, args.step_timeout, args.settle)
-                    except asyncio.TimeoutError:
-                        raise RuntimeError(f"timeout waiting for the agent at step {i + 1}") from None
-                    i += 1
-                # Conditional caller reply: the agent asks again whether to
-                # place the order (e.g. after the bridge refused a submit).
-                reply = case.get("reask_reply")
-                replies = 0
-                while (reply and replies < MAX_REASK_REPLIES
-                       and asks_to_place_order(state.agent[-1])
-                       and not any(c["name"] == "submit_order" and "error" not in c["result"]
-                                   for c in recorder.calls)):
-                    replies += 1
-                    steps.append({"say": reply, "explicit_yes": True, "auto_reply": True})
-                    state.agent.append("")
-                    begin(len(steps) - 1)
-                    await session.send_realtime_input(text=reply)
-                    try:
-                        await _wait_turn_done(events, bridge, args.step_timeout, args.settle)
-                    except asyncio.TimeoutError:
-                        raise RuntimeError(f"timeout waiting for the agent at re-ask reply {replies}") from None
-            finally:
-                cancelled = bool(getattr(bridge, "_cancelled", None))
-                for task in (reader, worker):
-                    task.cancel()
-                await asyncio.gather(reader, worker, return_exceptions=True)
+                        if i + 1 < len(steps) and steps[i + 1].get("barge_in"):
+                            await _wait_for_activity(events, args.step_timeout)
+                            i += 1
+                            begin(i)
+                            await session.send_realtime_input(text=steps[i]["say"])
+                        try:
+                            await _wait_turn_done(events, bridge, args.step_timeout, args.settle)
+                        except asyncio.TimeoutError:
+                            raise RuntimeError(f"timeout waiting for the agent at step {i + 1}") from None
+                        i += 1
+                    # Conditional caller reply: the agent asks again whether to
+                    # place the order (e.g. after the bridge refused a submit).
+                    reply = case.get("reask_reply")
+                    replies = 0
+                    while (reply and replies < MAX_REASK_REPLIES
+                           and asks_to_place_order(state.agent[-1])
+                           and not any(c["name"] == "submit_order" and "error" not in c["result"]
+                                       for c in recorder.calls)):
+                        replies += 1
+                        steps.append({"say": reply, "explicit_yes": True, "auto_reply": True})
+                        state.agent.append("")
+                        begin(len(steps) - 1)
+                        await session.send_realtime_input(text=reply)
+                        try:
+                            await _wait_turn_done(events, bridge, args.step_timeout, args.settle)
+                        except asyncio.TimeoutError:
+                            raise RuntimeError(f"timeout waiting for the agent at re-ask reply {replies}") from None
+                finally:
+                    cancelled = bool(getattr(bridge, "_cancelled", None))
+                    for task in (reader, worker):
+                        task.cancel()
+                    await asyncio.gather(reader, worker, return_exceptions=True)
+    except TimeoutError:
+        error = f"session timeout after {args.session_timeout:.0f}s"
     except Exception as exc:
         rejected = handshake_rejection(exc)
         error = (f"handshake HTTP {rejected[0]}: {rejected[1]}" if rejected
                  else f"{type(exc).__name__}: {exc}")
     finally:
         await http.aclose()
+    elapsed = time.monotonic() - started
+    if error and elapsed > args.session_timeout * SLEEP_FACTOR:
+        # Far beyond the timeout: the event loop was not running (laptop asleep).
+        error = (f"{SLEEP_PREFIX} run took {elapsed:.0f}s, session timeout is "
+                 f"{args.session_timeout:.0f}s (was: {error})")
 
     run = {
         "session_id": session_id,
@@ -316,6 +332,8 @@ async def run_case(client: Any, case: dict, args: argparse.Namespace) -> dict:
         ],
         "final_order": order_service.get_order(session_id).model_dump(),
         "tool_call_cancellation_seen": cancelled,
+        "audio_cuts": bridge.audio_cuts,
+        "guesses_blocked": bridge.guesses_blocked,
         "events": log.events,
         "seconds": round(time.monotonic() - started, 1),
         "error": error,
@@ -442,6 +460,14 @@ _QUOTA_ERROR = re.compile(
 MAX_CONSECUTIVE_QUOTA_ERRORS = 2
 
 
+SLEEP_PREFIX = "suspected machine sleep:"
+SLEEP_FACTOR = 1.5  # a run this many times longer than the session timeout
+
+
+def is_sleep_error(error: Optional[str]) -> bool:
+    return bool(error) and error.startswith(SLEEP_PREFIX)
+
+
 def is_quota_error(error: Optional[str]) -> bool:
     return bool(error) and bool(_QUOTA_ERROR.search(error))
 
@@ -512,6 +538,10 @@ async def main(args: argparse.Namespace) -> int:
                 stop["not_started"] += 1
                 return
             run = await run_case(client, case, args)
+            if is_sleep_error(run["error"]):
+                infra.append({"case": case["id"], "run": n, "error": run["error"]})
+                print(f"  SLEEP {case['id']} run {n}/{args.runs}: {run['error'][:150]}", flush=True)
+                return
             if is_quota_error(run["error"]):
                 stop["streak"] += 1
                 infra.append({"case": case["id"], "run": n, "error": run["error"]})
@@ -530,7 +560,7 @@ async def main(args: argparse.Namespace) -> int:
     per_case, per_check = summarize(cases, results)
     print_report(meta, per_case, per_check, results, args.threshold)
     if infra:
-        print(f"\nnot scored, rate-limit/quota errors ({len(infra)}):")
+        print(f"\nnot scored, infrastructure errors (quota / machine sleep) ({len(infra)}):")
         for item in infra:
             print(f"  {item['case']} run {item['run']}: {item['error'][:150]}")
 
@@ -566,6 +596,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--api-version", default=LIVE_API_VERSION)
     p.add_argument("--language", default=DEFAULT_LANGUAGE)
     p.add_argument("--step-timeout", type=float, default=60.0, help="seconds per caller turn")
+    p.add_argument("--session-timeout", type=float, default=300.0,
+                   help="seconds per case run (whole Live session) before it fails (default 300)")
     p.add_argument("--settle", type=float, default=2.0,
                    help="quiet seconds after a turn before the next caller turn")
     p.add_argument("--verbose", action="store_true", help="show bridge logs (tool calls etc.)")
