@@ -596,3 +596,17 @@ def test_session_timeout_option():
 
     assert parse_args([]).session_timeout == 300
     assert parse_args(["--session-timeout", "90"]).session_timeout == 90
+
+
+def test_header_shows_the_prompt_file_actually_used():
+    from evals.run import prompt_line
+
+    git = {"head": "abc1234", "files": {"live/system-instruction.md": {
+        "blob": "8d1dcd278c16bdaa", "last_commit": "bf01250", "uncommitted_changes": False}}}
+    default = prompt_line({"system_instruction": "live/system-instruction.md",
+                           "system_instruction_blob": None, "git": git})
+    assert default == "prompt live/system-instruction.md  blob=8d1dcd278c16  last_commit=bf01250"
+    experiment = prompt_line({"system_instruction": "evals/experiments/tagged.md",
+                              "system_instruction_blob": "726faa97719fb141", "git": git})
+    assert experiment == "prompt evals/experiments/tagged.md (--system-instruction)  blob=726faa97719f"
+    assert "8d1dcd278c16" not in experiment

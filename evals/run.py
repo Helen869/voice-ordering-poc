@@ -334,6 +334,7 @@ async def run_case(client: Any, case: dict, args: argparse.Namespace) -> dict:
         "tool_call_cancellation_seen": cancelled,
         "audio_cuts": bridge.audio_cuts,
         "guesses_blocked": bridge.guesses_blocked,
+        "turns_stalled": bridge.stalls,
         "events": log.events,
         "seconds": round(time.monotonic() - started, 1),
         "error": error,
@@ -396,13 +397,22 @@ def summarize(cases: list[dict], results: dict[str, list[dict]]) -> tuple[dict, 
     return per_case, {k: {"passed": v[0], "applicable": v[1], "rate": v[0] / v[1]} for k, v in per_check.items()}
 
 
-def print_report(meta: dict, per_case: dict, per_check: dict, results: dict, threshold: float) -> None:
+def prompt_line(meta: dict) -> str:
+    """The prompt file actually used, with its git blob hash: the default one, or
+    the --system-instruction file of an experiment."""
+    if meta.get("system_instruction_blob"):
+        return (f"prompt {meta['system_instruction']} (--system-instruction)  "
+                f"blob={meta['system_instruction_blob'][:12]}")
     prompt = meta["git"]["files"]["live/system-instruction.md"]
+    return (f"prompt live/system-instruction.md  blob={prompt['blob'][:12]}  "
+            f"last_commit={prompt['last_commit']}"
+            f"{'  (UNCOMMITTED CHANGES)' if prompt['uncommitted_changes'] else ''}")
+
+
+def print_report(meta: dict, per_case: dict, per_check: dict, results: dict, threshold: float) -> None:
     print(f"\nLive agent evals  model={meta['model']}  api={meta['api_version']}  "
           f"runs/case={meta['runs']}  threshold={threshold:.0%}")
-    print(f"prompt live/system-instruction.md  blob={prompt['blob'][:12]}  "
-          f"last_commit={prompt['last_commit']}{'  (UNCOMMITTED CHANGES)' if prompt['uncommitted_changes'] else ''}"
-          f"  HEAD={meta['git']['head']}\n")
+    print(f"{prompt_line(meta)}  HEAD={meta['git']['head']}\n")
     width = max((len(c) for c in per_case), default=4)
     print(f"{'case':<{width}}  pass   rate   failing checks")
     for cid, s in per_case.items():
