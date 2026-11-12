@@ -209,8 +209,13 @@ REANSWER_NOTE = ("System note: your last reply was cut off because it contained 
 # No-progress watchdog: a turn that has started (audio, transcript or a function
 # call) and then produces nothing for this long without ending is stalled (seen
 # live: an unmarked self-talk reply that never completed the turn). Running
-# tools and a just-sent tool response count as progress.
+# tools and a just-sent tool response count as progress. Measured from when the
+# turn's audio would finish playing, not from the last chunk's arrival: audio
+# arrives faster than real time, and the server sends turn_complete only when
+# real-time playback would end (eval baseline: median 0.03 s after it, up to
+# 7.8 s after the last chunk arrived).
 TURN_STALL_S = 8.0
+OUTPUT_BYTES_PER_S = 24_000 * 2  # model audio: 24 kHz mono 16-bit PCM
 STALL_NOTE = ("System note: your last reply stopped before it was finished. Briefly answer the "
               "caller's last question again, in plain spoken words only.")
 # Caller speech onset from mic energy (16 kHz 16-bit PCM). Fail-open: noise that
@@ -276,6 +281,7 @@ class CallBridge:
         # No-progress watchdog
         self._turn_open = False
         self._last_progress = 0.0
+        self._playback_end = 0.0  # when the open turn's audio would finish playing
         self._watchdog: Optional[asyncio.Task] = None
         self.stalls = 0
         # Guessed-answer guard: agent asked a question, caller has not spoken since.
@@ -357,7 +363,9 @@ class CallBridge:
                 self.resumption_handle = upd.new_handle
         if getattr(msg, "tool_call", None) or getattr(getattr(msg, "server_content", None), "model_turn", None):
             self._responses_answered = self.tool_responses_sent  # model output = it moved on
-            self._progress()
+            model_turn = getattr(getattr(msg, "server_content", None), "model_turn", None)
+            self._progress(sum(len(p.inline_data.data) for p in (getattr(model_turn, "parts", None) or [])
+                               if getattr(p, "inline_data", None) and p.inline_data.data))
         if getattr(msg, "tool_call", None):
             batch = list(msg.tool_call.function_calls or [])
             if batch:  # one message = one batch = one tool response
@@ -491,10 +499,13 @@ class CallBridge:
             await self._maybe_flush_notes(force=True)
 
     # -- no-progress watchdog -------------------------------------------------
-    def _progress(self) -> None:
+    def _progress(self, audio_bytes: int = 0) -> None:
         """The model produced audio, transcript or a function call: a turn is open."""
         loop = asyncio.get_running_loop()
         self._last_progress = loop.time()
+        if audio_bytes:
+            self._playback_end = (max(self._playback_end, self._last_progress)
+                                  + audio_bytes / OUTPUT_BYTES_PER_S)
         if not self._turn_open:
             self._turn_open = True
             if self._watchdog is None or self._watchdog.done():
@@ -502,6 +513,7 @@ class CallBridge:
 
     def _end_turn_watch(self) -> None:
         self._turn_open = False
+        self._playback_end = 0.0
         if self._watchdog:
             self._watchdog.cancel()
             self._watchdog = None
@@ -511,12 +523,13 @@ class CallBridge:
         while self._turn_open:
             if not self.tools_idle:  # a slow backend is not a stalled model
                 self._last_progress = loop.time()
-            wait = self._last_progress + TURN_STALL_S - loop.time()
+            wait = max(self._last_progress, self._playback_end) + TURN_STALL_S - loop.time()
             if wait > 0:
                 await asyncio.sleep(wait)
                 continue
             self.stalls += 1
-            logger.warning("agent turn made no progress for %.0fs and has not ended", TURN_STALL_S)
+            logger.warning("agent turn made no progress for %.0fs after its audio would have "
+                           "finished playing, and has not ended", TURN_STALL_S)
             self._guard_event("turn_stalled", text=self._turn_text[-200:])
             if self.reanswers >= MAX_REANSWERS_PER_CALL:
                 return

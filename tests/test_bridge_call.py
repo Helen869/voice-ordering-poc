@@ -1073,3 +1073,39 @@ def test_stall_note_repeats_only_while_the_cap_allows(monkeypatch):
     texts, stalls = asyncio.run(go())
     assert texts == [STALL_NOTE] * MAX_REANSWERS_PER_CALL
     assert stalls == MAX_REANSWERS_PER_CALL + 1
+
+
+def test_long_reply_still_playing_is_not_a_stall(monkeypatch):
+    """Audio arrives faster than real time; turn_complete comes when playback would end."""
+    fast_watchdog(monkeypatch)
+    from live.bridge.call import OUTPUT_BYTES_PER_S
+
+    async def go():
+        session = FakeSession()
+        bridge = CallBridge(FakeRouter())
+        bridge.attach(session)
+        await bridge.on_message(spoken("To confirm: your whole order. Place it?",
+                                       audio=b"\x00" * int(OUTPUT_BYTES_PER_S * 0.2)))
+        await asyncio.sleep(0.2)                # 4x the stall time after the last chunk
+        await bridge.on_message(content(turn_complete=True))
+        return session.texts, bridge.stalls
+
+    assert asyncio.run(go()) == ([], 0)
+
+
+def test_stall_is_measured_from_the_end_of_playback(monkeypatch):
+    fast_watchdog(monkeypatch, stall_s=0.1)
+    from live.bridge.call import OUTPUT_BYTES_PER_S
+
+    async def go():
+        session = FakeSession()
+        bridge = CallBridge(FakeRouter())
+        bridge.attach(session)
+        await bridge.on_message(spoken("Which protein? I will ask which protein.",
+                                       audio=b"\x00" * int(OUTPUT_BYTES_PER_S * 0.3)))
+        await asyncio.sleep(0.25)               # still playing: no stall yet
+        during_playback = list(session.texts)
+        await asyncio.sleep(0.2)                # playback ended at 0.3, stall at 0.4 (next at 0.5)
+        return during_playback, session.texts
+
+    assert asyncio.run(go()) == ([], [STALL_NOTE])
