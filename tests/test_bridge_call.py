@@ -890,3 +890,186 @@ def test_block_event_records_timing_for_false_block_analysis():
     assert kinds == ["question", "guess_blocked"]
     blocked = events[1][1]
     assert blocked["since_question_s"] is not None and blocked["since_signal_s"] == {}
+
+
+# -- "System note" leak marker -------------------------------------------------------
+from live.bridge.call import LEAK_MARKER
+
+
+def test_system_note_written_by_the_model_is_a_leak():
+    """Seen on gemini-3.1-flash-live-preview: the model writes its own notes."""
+    for text in ("System note: The user wants fried rice, but fried rice requires a protein.",
+                 "system note - ask for the protein",
+                 "Sure, one moment.\nSystem note: item id for fried rice is fried-rice.",
+                 "  System Note: next state should ask"):
+        assert LEAK_MARKER.search(text), text
+
+
+def test_system_note_mid_sentence_or_similar_words_are_not_cut():
+    for text in ("I'll make a note of that.", "Our ordering system is down, sorry.",
+                 "Sure - the system notes your order, $12.49. Anything else?"):
+        assert not LEAK_MARKER.search(text), text
+
+
+def test_system_note_turn_is_cut_and_reanswered():
+    async def go():
+        session = FakeSession()
+        bridge = CallBridge(FakeRouter())
+        bridge.attach(session)
+        await bridge.on_message(spoken("System"))
+        first = bridge.audio_muted
+        await bridge.on_message(spoken(" note: the user wants fried rice. Ask for the protein."))
+        await bridge.on_message(content(turn_complete=True))
+        return first, bridge.audio_cuts, session.texts
+
+    assert asyncio.run(go()) == (False, 1, [REANSWER_NOTE])
+
+
+# -- no-progress watchdog ----------------------------------------------------------
+from live.bridge.call import STALL_NOTE
+
+
+def fast_watchdog(monkeypatch, stall_s=0.05):
+    import live.bridge.call as call_mod
+
+    monkeypatch.setattr(call_mod, "TURN_STALL_S", stall_s)
+
+
+def test_stalled_turn_gets_the_reanswer_note(monkeypatch):
+    """Control r3 run 6: unmarked self-talk, then nothing, and the turn never ended."""
+    fast_watchdog(monkeypatch)
+
+    async def go():
+        session = FakeSession()
+        bridge = CallBridge(FakeRouter())
+        events = []
+        bridge.on_guard_event = lambda kind, **f: events.append(kind)
+        bridge.attach(session)
+        await bridge.on_message(spoken('Sure - which protein? I will ask: "which protein?"', audio=b"\x00" * 10))
+        await asyncio.sleep(0.08)
+        return session.texts, bridge.stalls, events, bridge.audio_cuts
+
+    texts, stalls, events, cuts = asyncio.run(go())
+    assert texts == [STALL_NOTE] and stalls == 1 and cuts == 0
+    assert "turn_stalled" in events
+
+
+def test_turn_that_ends_is_not_a_stall(monkeypatch):
+    fast_watchdog(monkeypatch)
+
+    async def go():
+        session = FakeSession()
+        bridge = CallBridge(FakeRouter())
+        bridge.attach(session)
+        await bridge.on_message(spoken("Which protein would you like?"))
+        await bridge.on_message(content(turn_complete=True))
+        await asyncio.sleep(0.15)
+        return session.texts, bridge.stalls
+
+    assert asyncio.run(go()) == ([], 0)
+
+
+def test_steady_output_is_not_a_stall(monkeypatch):
+    fast_watchdog(monkeypatch, stall_s=0.08)
+
+    async def go():
+        session = FakeSession()
+        bridge = CallBridge(FakeRouter())
+        bridge.attach(session)
+        for _ in range(6):                      # 0.18 s of output, never 0.08 s apart
+            await bridge.on_message(spoken("word "))
+            await asyncio.sleep(0.03)
+        await bridge.on_message(content(turn_complete=True))
+        return session.texts, bridge.stalls
+
+    assert asyncio.run(go()) == ([], 0)
+
+
+def test_no_turn_open_means_no_watchdog(monkeypatch):
+    """Silence between turns (the caller thinking) is never a stall."""
+    fast_watchdog(monkeypatch)
+
+    async def go():
+        session = FakeSession()
+        bridge = CallBridge(FakeRouter())
+        bridge.attach(session)
+        await asyncio.sleep(0.15)
+        return session.texts, bridge.stalls
+
+    assert asyncio.run(go()) == ([], 0)
+
+
+def test_slow_tool_is_not_a_stall(monkeypatch):
+    fast_watchdog(monkeypatch)
+
+    async def go():
+        gate = asyncio.Event()
+        router, session = FakeRouter(result={"items": []}, gate=gate), FakeSession()
+        bridge = CallBridge(router)
+        bridge.attach(session)
+        worker = asyncio.create_task(bridge.run_tools())
+        await bridge.on_message(tool_call(("1", "get_order", {})))
+        await asyncio.sleep(0.2)                # backend slow: 4x the stall time
+        texts_while_tool_ran = list(session.texts)
+        gate.set()
+        await drain(bridge)
+        await asyncio.sleep(0.02)               # the reply is due from the response, not before
+        early = list(session.texts)
+        worker.cancel()
+        return texts_while_tool_ran, early
+
+    assert asyncio.run(go()) == ([], [])
+
+
+def test_model_silent_after_a_tool_response_is_a_stall(monkeypatch):
+    fast_watchdog(monkeypatch)
+
+    async def go():
+        session = FakeSession()
+        bridge = CallBridge(FakeRouter(result={"items": []}))
+        bridge.attach(session)
+        worker = asyncio.create_task(bridge.run_tools())
+        await bridge.on_message(tool_call(("1", "get_order", {})))
+        await drain(bridge)
+        await asyncio.sleep(0.08)
+        worker.cancel()
+        return session.texts
+
+    assert asyncio.run(go()) == [STALL_NOTE]
+
+
+def test_stall_and_cut_reanswers_share_the_cap(monkeypatch):
+    fast_watchdog(monkeypatch)
+    import live.bridge.call as call_mod
+
+    monkeypatch.setattr(call_mod, "REANSWER_GRACE_S", 10.0)  # keep the cut path's forced send out of it
+
+    async def go():
+        session = FakeSession()
+        bridge = CallBridge(FakeRouter())
+        bridge.attach(session)
+        for _ in range(MAX_REANSWERS_PER_CALL):
+            await bridge.on_message(spoken("<context>{}</context>", turn_complete=True))
+        await bridge.on_message(spoken("Which protein? I will ask which protein."))
+        await asyncio.sleep(0.15)               # stalls, but the cap is used up
+        return session.texts, bridge.stalls
+
+    texts, stalls = asyncio.run(go())
+    assert texts == [REANSWER_NOTE] * MAX_REANSWERS_PER_CALL
+    assert stalls == 1
+
+
+def test_stall_note_repeats_only_while_the_cap_allows(monkeypatch):
+    fast_watchdog(monkeypatch)
+
+    async def go():
+        session = FakeSession()
+        bridge = CallBridge(FakeRouter())
+        bridge.attach(session)
+        await bridge.on_message(spoken("Which protein? I will ask which protein."))
+        await asyncio.sleep(0.4)                # the note does not unstick it; nothing ends the turn
+        return session.texts, bridge.stalls
+
+    texts, stalls = asyncio.run(go())
+    assert texts == [STALL_NOTE] * MAX_REANSWERS_PER_CALL
+    assert stalls == MAX_REANSWERS_PER_CALL + 1

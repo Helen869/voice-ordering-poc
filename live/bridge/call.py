@@ -192,10 +192,13 @@ NO_NUMBER_NOTE = ("System note: no order has been placed yet, so there is no "
 
 
 # Transcript text that is never speech: JSON braces, backticks (code), a markup tag
-# (<context>, <no speech>), a markdown rule, bold, or a bullet line ("*   *Step 1").
+# (<context>, <no speech>), a markdown rule, bold, a bullet line ("*   *Step 1"), or a
+# line starting with "System note" (the model writing its own notes; seen on
+# gemini-3.1-flash-live-preview). Real system notes only go TO the model.
 # Conservative on purpose: normal spoken replies contain none of these.
-LEAK_MARKER = re.compile(r"[{}`]|<[a-z][a-z ]*>|^\s*-{3,}\s*$|\*\*|^\s*\*\s",
+LEAK_MARKER = re.compile(r"[{}`]|<[a-z][a-z ]*>|^\s*-{3,}\s*$|\*\*|^\s*\*\s|^\s*system note\b",
                          re.IGNORECASE | re.MULTILINE)
+# Re-answer notes per call, after audio cuts and stalled turns together.
 MAX_REANSWERS_PER_CALL = 2
 # After a cut, send the re-answer note anyway if the turn has not ended by then
 # (seen live: a leaking model kept generating and never completed the turn).
@@ -203,6 +206,13 @@ REANSWER_GRACE_S = 2.0
 REANSWER_NOTE = ("System note: your last reply was cut off because it contained internal text, "
                  "not speech. Briefly answer the caller's last question again, in plain spoken "
                  "words only.")
+# No-progress watchdog: a turn that has started (audio, transcript or a function
+# call) and then produces nothing for this long without ending is stalled (seen
+# live: an unmarked self-talk reply that never completed the turn). Running
+# tools and a just-sent tool response count as progress.
+TURN_STALL_S = 8.0
+STALL_NOTE = ("System note: your last reply stopped before it was finished. Briefly answer the "
+              "caller's last question again, in plain spoken words only.")
 # Caller speech onset from mic energy (16 kHz 16-bit PCM). Fail-open: noise that
 # crosses the threshold only releases the guard early, it never blocks a call.
 CALLER_SPEECH_PEAK = 1500          # peak sample level (of 32767) counted as voice
@@ -262,6 +272,12 @@ class CallBridge:
         self._clear_playback = False  # drop audio already queued for the caller
         self.audio_cuts = 0
         self._forced_reanswer: Optional[asyncio.Task] = None
+        self.reanswers = 0  # re-answer notes queued (cuts and stalls; capped per call)
+        # No-progress watchdog
+        self._turn_open = False
+        self._last_progress = 0.0
+        self._watchdog: Optional[asyncio.Task] = None
+        self.stalls = 0
         # Guessed-answer guard: agent asked a question, caller has not spoken since.
         # Released by whichever caller-speech signal comes first: mic energy
         # (immediate), server voice activity, the input transcript (lags), or
@@ -293,6 +309,7 @@ class CallBridge:
 
     def attach(self, session: Any) -> None:
         self._session = session
+        self._end_turn_watch()  # a turn open on a dropped session will never end
 
     def caller_input(self) -> None:
         """The caller said something (text mode, where there is no caller audio)."""
@@ -340,6 +357,7 @@ class CallBridge:
                 self.resumption_handle = upd.new_handle
         if getattr(msg, "tool_call", None) or getattr(getattr(msg, "server_content", None), "model_turn", None):
             self._responses_answered = self.tool_responses_sent  # model output = it moved on
+            self._progress()
         if getattr(msg, "tool_call", None):
             batch = list(msg.tool_call.function_calls or [])
             if batch:  # one message = one batch = one tool response
@@ -366,6 +384,7 @@ class CallBridge:
                     if who == "caller":
                         self._caller_spoke("transcript")
                     else:
+                        self._progress()
                         self._turn_text += tr.text
                         self._check_spoken_numbers(final=False)
                         if "?" in tr.text:
@@ -386,6 +405,7 @@ class CallBridge:
                 if self._forced_reanswer:
                     self._forced_reanswer.cancel()  # the turn ended normally
                     self._forced_reanswer = None
+                self._end_turn_watch()
                 self._model_idle = True
                 await self._maybe_flush_notes()
 
@@ -439,6 +459,7 @@ class CallBridge:
         if live:
             await self._session.send_tool_response(function_responses=live)
             self.tool_responses_sent += 1
+            self._last_progress = asyncio.get_running_loop().time()  # the model's reply is due from now
         for number in submits.values():
             self._set_confirmation(number)
         self._sent_submits.update(submits)
@@ -453,8 +474,9 @@ class CallBridge:
         self.audio_cuts += 1
         logger.warning("leak in agent transcript: audio cut for the rest of the turn")
         self._guard_event("audio_cut", text=self._turn_text[-200:])
-        if self.audio_cuts <= MAX_REANSWERS_PER_CALL:
-            self._queue_text(f"reanswer-{self.audio_cuts}", REANSWER_NOTE)
+        if self.reanswers < MAX_REANSWERS_PER_CALL:
+            self.reanswers += 1
+            self._queue_text(f"reanswer-{self.reanswers}", REANSWER_NOTE)
             self._forced_reanswer = asyncio.get_running_loop().create_task(
                 self._reanswer_if_turn_hangs(self.audio_cuts))
 
@@ -467,6 +489,41 @@ class CallBridge:
                            REANSWER_GRACE_S)
             self._guard_event("reanswer_forced")
             await self._maybe_flush_notes(force=True)
+
+    # -- no-progress watchdog -------------------------------------------------
+    def _progress(self) -> None:
+        """The model produced audio, transcript or a function call: a turn is open."""
+        loop = asyncio.get_running_loop()
+        self._last_progress = loop.time()
+        if not self._turn_open:
+            self._turn_open = True
+            if self._watchdog is None or self._watchdog.done():
+                self._watchdog = loop.create_task(self._watch_turn())
+
+    def _end_turn_watch(self) -> None:
+        self._turn_open = False
+        if self._watchdog:
+            self._watchdog.cancel()
+            self._watchdog = None
+
+    async def _watch_turn(self) -> None:
+        loop = asyncio.get_running_loop()
+        while self._turn_open:
+            if not self.tools_idle:  # a slow backend is not a stalled model
+                self._last_progress = loop.time()
+            wait = self._last_progress + TURN_STALL_S - loop.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+                continue
+            self.stalls += 1
+            logger.warning("agent turn made no progress for %.0fs and has not ended", TURN_STALL_S)
+            self._guard_event("turn_stalled", text=self._turn_text[-200:])
+            if self.reanswers >= MAX_REANSWERS_PER_CALL:
+                return
+            self.reanswers += 1
+            self._queue_text(f"stall-{self.reanswers}", STALL_NOTE)
+            await self._maybe_flush_notes(force=True)  # new input interrupts the stalled turn
+            self._last_progress = loop.time()
 
     # -- confirmation-number guard -------------------------------------------
     def _set_confirmation(self, number: str) -> None:
