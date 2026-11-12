@@ -191,12 +191,15 @@ NO_NUMBER_NOTE = ("System note: no order has been placed yet, so there is no "
                   "confirmation number. Don't give one until the order is placed.")
 
 
-# Transcript text that is never speech: JSON braces, a code fence, a markup tag
+# Transcript text that is never speech: JSON braces, backticks (code), a markup tag
 # (<context>, <no speech>), a markdown rule, bold, or a bullet line ("*   *Step 1").
 # Conservative on purpose: normal spoken replies contain none of these.
-LEAK_MARKER = re.compile(r"[{}]|```|<[a-z][a-z ]*>|^\s*-{3,}\s*$|\*\*|^\s*\*\s",
+LEAK_MARKER = re.compile(r"[{}`]|<[a-z][a-z ]*>|^\s*-{3,}\s*$|\*\*|^\s*\*\s",
                          re.IGNORECASE | re.MULTILINE)
 MAX_REANSWERS_PER_CALL = 2
+# After a cut, send the re-answer note anyway if the turn has not ended by then
+# (seen live: a leaking model kept generating and never completed the turn).
+REANSWER_GRACE_S = 2.0
 REANSWER_NOTE = ("System note: your last reply was cut off because it contained internal text, "
                  "not speech. Briefly answer the caller's last question again, in plain spoken "
                  "words only.")
@@ -249,6 +252,7 @@ class CallBridge:
         self.audio_muted = False
         self._clear_playback = False  # drop audio already queued for the caller
         self.audio_cuts = 0
+        self._forced_reanswer: Optional[asyncio.Task] = None
         # Guessed-answer guard: agent asked a question, caller has not spoken since.
         self._question_pending = False
         self.guesses_blocked = 0
@@ -331,6 +335,9 @@ class CallBridge:
                     self._early.clear()
                 self._turn_text, self._turn_scanned = "", 0
                 self.audio_muted = False  # the next turn (e.g. the re-answer) is heard again
+                if self._forced_reanswer:
+                    self._forced_reanswer.cancel()  # the turn ended normally
+                    self._forced_reanswer = None
                 self._model_idle = True
                 await self._maybe_flush_notes()
 
@@ -396,6 +403,18 @@ class CallBridge:
         self._guard_event("audio_cut", text=self._turn_text[-200:])
         if self.audio_cuts <= MAX_REANSWERS_PER_CALL:
             self._queue_text(f"reanswer-{self.audio_cuts}", REANSWER_NOTE)
+            self._forced_reanswer = asyncio.get_running_loop().create_task(
+                self._reanswer_if_turn_hangs(self.audio_cuts))
+
+    async def _reanswer_if_turn_hangs(self, cut: int) -> None:
+        """The muted turn has not ended after the grace period: send the
+        re-answer note now (new input interrupts the model's generation)."""
+        await asyncio.sleep(REANSWER_GRACE_S)
+        if self.audio_muted and self.audio_cuts == cut:
+            logger.warning("turn still running %.1fs after an audio cut: sending the re-answer note now",
+                           REANSWER_GRACE_S)
+            self._guard_event("reanswer_forced")
+            await self._maybe_flush_notes(force=True)
 
     # -- confirmation-number guard -------------------------------------------
     def _set_confirmation(self, number: str) -> None:
@@ -433,8 +452,8 @@ class CallBridge:
             self._noted.add(key)
             self._notes.append(note)
 
-    async def _maybe_flush_notes(self) -> None:
-        if not self._model_idle or self._session is None:
+    async def _maybe_flush_notes(self, force: bool = False) -> None:
+        if (not self._model_idle and not force) or self._session is None:
             return
         while self._notes:
             # Realtime text, not send_client_content: the SDK warns against

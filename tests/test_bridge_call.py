@@ -768,3 +768,49 @@ def test_submit_after_unanswered_question_is_blocked_and_statements_do_not_block
 
 def test_live_config_has_caller_transcription_for_the_guard():
     assert build_live_config(None)["input_audio_transcription"] == {}
+
+
+def test_plain_english_reasoning_with_inline_code_is_cut():
+    """Seen live: 'The user wants fried rice. ... the `fried-rice` item requires a `protein`'."""
+    async def go():
+        bridge = CallBridge(FakeRouter())
+        bridge.attach(FakeSession())
+        await bridge.on_message(spoken("Sure - which protein? The user wants fried rice. Looking at the "))
+        muted_before_code = bridge.audio_muted
+        await bridge.on_message(spoken("search results, the `fried-rice` item requires a `protein`"))
+        return muted_before_code, bridge.audio_muted
+
+    assert asyncio.run(go()) == (False, True)
+
+
+def test_reanswer_note_is_forced_when_a_cut_turn_never_ends(monkeypatch):
+    import live.bridge.call as call_mod
+
+    monkeypatch.setattr(call_mod, "REANSWER_GRACE_S", 0.05)
+
+    async def go():
+        session = FakeSession()
+        bridge = CallBridge(FakeRouter())
+        bridge.attach(session)
+        await bridge.on_message(spoken("Which protein? The user wants `fried-rice`"))  # cut, no turn end
+        await asyncio.sleep(0.1)
+        return session.texts
+
+    assert asyncio.run(go()) == [REANSWER_NOTE]
+
+
+def test_forced_reanswer_cancelled_when_turn_ends_normally(monkeypatch):
+    import live.bridge.call as call_mod
+
+    monkeypatch.setattr(call_mod, "REANSWER_GRACE_S", 0.05)
+
+    async def go():
+        session = FakeSession()
+        bridge = CallBridge(FakeRouter())
+        bridge.attach(session)
+        await bridge.on_message(spoken("<context>{}</context>"))
+        await bridge.on_message(content(turn_complete=True))      # normal end: note sent once here
+        await asyncio.sleep(0.1)                                   # no second, forced send
+        return session.texts
+
+    assert asyncio.run(go()) == [REANSWER_NOTE]
