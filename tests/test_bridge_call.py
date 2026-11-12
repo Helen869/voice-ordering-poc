@@ -814,3 +814,79 @@ def test_forced_reanswer_cancelled_when_turn_ends_normally(monkeypatch):
         return session.texts
 
     assert asyncio.run(go()) == [REANSWER_NOTE]
+
+
+# -- caller-speech signals for the guessed-answer guard (audio mode) -----------------------
+from live.bridge.call import CALLER_SPEECH_MIN_MS, CALLER_SPEECH_PEAK
+
+
+def mic(level, ms=20):
+    return pcm(*([level] * (16 * ms)))  # 16 samples per ms at 16 kHz
+
+
+def asked_bridge():
+    bridge = CallBridge(FakeRouter())
+    bridge.attach(FakeSession())
+    return bridge
+
+
+def test_mic_energy_releases_the_guard_without_waiting_for_a_transcript():
+    async def go():
+        bridge = asked_bridge()
+        events = []
+        bridge.on_guard_event = lambda kind, **f: events.append((kind, f))
+        await bridge.on_message(spoken("Which protein would you like?"))
+        pending = [bridge._question_pending]
+        for _ in range(CALLER_SPEECH_MIN_MS // 20 - 1):
+            bridge.caller_audio(mic(CALLER_SPEECH_PEAK + 500))
+        pending.append(bridge._question_pending)     # not yet: too short to be speech
+        bridge.caller_audio(mic(CALLER_SPEECH_PEAK + 500))
+        pending.append(bridge._question_pending)     # sustained voice: released
+        return pending, [e for e in events if e[0] == "caller_speech"]
+
+    pending, speech = asyncio.run(go())
+    assert pending == [True, True, False]
+    assert speech == [("caller_speech", {"signal": "energy", "released": True})]
+
+
+def test_quiet_line_noise_does_not_count_as_speech():
+    async def go():
+        bridge = asked_bridge()
+        await bridge.on_message(spoken("Which protein?"))
+        for _ in range(50):  # one second of low-level noise
+            bridge.caller_audio(mic(CALLER_SPEECH_PEAK // 4))
+        return bridge._question_pending
+
+    assert asyncio.run(go()) is True
+
+
+def test_server_voice_activity_start_releases_the_guard():
+    async def go():
+        bridge = asked_bridge()
+        await bridge.on_message(spoken("Which protein?"))
+        await bridge.on_message(NS(voice_activity=NS(voice_activity_type="ACTIVITY_START"),
+                                   server_content=None, tool_call=None, tool_call_cancellation=None,
+                                   session_resumption_update=None))
+        return bridge._question_pending
+
+    assert asyncio.run(go()) is False
+
+
+def test_block_event_records_timing_for_false_block_analysis():
+    async def go():
+        bridge = CallBridge(FakeRouter(result={"subtotal": 1}))
+        bridge.attach(FakeSession())
+        events = []
+        bridge.on_guard_event = lambda kind, **f: events.append((kind, f))
+        worker = asyncio.create_task(bridge.run_tools())
+        await bridge.on_message(spoken("Which protein?"))
+        await bridge.on_message(tool_call(ADD_SHRIMP))
+        await drain(bridge)
+        worker.cancel()
+        return events
+
+    events = asyncio.run(go())
+    kinds = [k for k, _ in events]
+    assert kinds == ["question", "guess_blocked"]
+    blocked = events[1][1]
+    assert blocked["since_question_s"] is not None and blocked["since_signal_s"] == {}

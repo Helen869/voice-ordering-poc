@@ -203,6 +203,13 @@ REANSWER_GRACE_S = 2.0
 REANSWER_NOTE = ("System note: your last reply was cut off because it contained internal text, "
                  "not speech. Briefly answer the caller's last question again, in plain spoken "
                  "words only.")
+# Caller speech onset from mic energy (16 kHz 16-bit PCM). Fail-open: noise that
+# crosses the threshold only releases the guard early, it never blocks a call.
+CALLER_SPEECH_PEAK = 1500          # peak sample level (of 32767) counted as voice
+CALLER_SPEECH_MIN_MS = 120         # sustained this long = the caller started speaking
+CALLER_SILENCE_RESET_MS = 300      # this much quiet ends the current utterance
+INPUT_BYTES_PER_MS = 16_000 * 2 // 1000
+
 UNANSWERED_QUESTION_ERROR = (
     "You asked the caller a question and they have not answered yet. Wait for their "
     "answer; don't assume it. Do not call this function again until the caller speaks.")
@@ -227,7 +234,9 @@ class AudioPort(Protocol):
 
 
 class CallBridge:
-    def __init__(self, router: ToolRouter, language: Optional[str] = DEFAULT_LANGUAGE) -> None:
+    def __init__(self, router: ToolRouter, language: Optional[str] = DEFAULT_LANGUAGE,
+                 speech_peak: int = CALLER_SPEECH_PEAK,
+                 speech_min_ms: int = CALLER_SPEECH_MIN_MS) -> None:
         self.router = router
         self.language = language
         self.resumption_handle: Optional[str] = None
@@ -254,8 +263,16 @@ class CallBridge:
         self.audio_cuts = 0
         self._forced_reanswer: Optional[asyncio.Task] = None
         # Guessed-answer guard: agent asked a question, caller has not spoken since.
+        # Released by whichever caller-speech signal comes first: mic energy
+        # (immediate), server voice activity, the input transcript (lags), or
+        # caller_input() in text mode.
         self._question_pending = False
+        self._question_at: Optional[float] = None
         self.guesses_blocked = 0
+        self._speech_peak, self._speech_min_ms = speech_peak, speech_min_ms
+        self._loud_ms = self._quiet_ms = 0.0
+        self._caller_speaking = False
+        self.last_caller_signal: dict[str, float] = {}  # signal kind -> loop time
         # Optional hook for guard events (the eval runner logs them).
         self.on_guard_event: Optional[Any] = None
 
@@ -278,7 +295,32 @@ class CallBridge:
         self._session = session
 
     def caller_input(self) -> None:
-        """The caller said something (text mode; audio mode uses the input transcript)."""
+        """The caller said something (text mode, where there is no caller audio)."""
+        self._caller_spoke("text")
+
+    def caller_audio(self, chunk: bytes) -> None:
+        """Every mic chunk sent upstream: detect the onset of caller speech from
+        energy, with no transcript lag."""
+        ms = len(chunk) / INPUT_BYTES_PER_MS
+        if pcm16_peak(chunk) >= self._speech_peak:
+            self._loud_ms += ms
+            self._quiet_ms = 0.0
+            if not self._caller_speaking and self._loud_ms >= self._speech_min_ms:
+                self._caller_speaking = True
+                self._caller_spoke("energy")
+        else:
+            self._quiet_ms += ms
+            if self._quiet_ms >= CALLER_SILENCE_RESET_MS:
+                self._loud_ms = 0.0
+                self._caller_speaking = False
+
+    def _caller_spoke(self, kind: str) -> None:
+        now = asyncio.get_event_loop().time()
+        previous = self.last_caller_signal.get(kind)
+        self.last_caller_signal[kind] = now
+        # One event per utterance and signal (transcript chunks arrive ~0.2 s apart).
+        if self._question_pending or previous is None or now - previous >= 1.0:
+            self._guard_event("caller_speech", signal=kind, released=self._question_pending)
         self._question_pending = False
 
     def take_clear_request(self) -> bool:
@@ -312,6 +354,9 @@ class CallBridge:
                 if call_id in self._sent_submits:
                     self._queue_note(self._sent_submits.pop(call_id))
             await self._maybe_flush_notes()
+        activity = getattr(msg, "voice_activity", None)
+        if activity is not None and "START" in str(getattr(activity, "voice_activity_type", "")):
+            self._caller_spoke("vad")
         content = getattr(msg, "server_content", None)
         if content:
             for attr, who in (("input_transcription", "caller"), ("output_transcription", "agent")):
@@ -319,11 +364,14 @@ class CallBridge:
                 if tr and getattr(tr, "text", None):
                     logger.info("[%s] %s", who, tr.text)
                     if who == "caller":
-                        self.caller_input()
+                        self._caller_spoke("transcript")
                     else:
                         self._turn_text += tr.text
                         self._check_spoken_numbers(final=False)
                         if "?" in tr.text:
+                            if not self._question_pending:
+                                self._question_at = asyncio.get_event_loop().time()
+                                self._guard_event("question")
                             self._question_pending = True
                         self._check_leak()
             if content.model_turn:
@@ -366,7 +414,11 @@ class CallBridge:
             if fc.name in ("update_order", "submit_order") and self._question_pending:
                 self.guesses_blocked += 1
                 logger.info("blocked %s(%s): question not answered yet", fc.name, args)
-                self._guard_event("guess_blocked", name=fc.name, args=args)
+                now = asyncio.get_event_loop().time()
+                self._guard_event(
+                    "guess_blocked", name=fc.name, args=args,
+                    since_question_s=round(now - self._question_at, 2) if self._question_at else None,
+                    since_signal_s={k: round(now - t, 2) for k, t in self.last_caller_signal.items()})
                 responses.append((fc, error_result(INVALID_ARGUMENTS, UNANSWERED_QUESTION_ERROR)))
                 continue
             result = await self.router.call(fc.name, args)
@@ -505,6 +557,7 @@ class CallBridge:
             while (chunk := await audio.read()) is not None:
                 if self.stats:
                     self.stats.mic(chunk)
+                self.caller_audio(chunk)
                 await session.send_realtime_input(
                     audio={"data": chunk, "mime_type": INPUT_AUDIO_MIME}
                 )
