@@ -315,7 +315,7 @@ class CallBridge:
                 self._caller_speaking = False
 
     def _caller_spoke(self, kind: str) -> None:
-        now = asyncio.get_event_loop().time()
+        now = asyncio.get_running_loop().time()
         previous = self.last_caller_signal.get(kind)
         self.last_caller_signal[kind] = now
         # One event per utterance and signal (transcript chunks arrive ~0.2 s apart).
@@ -370,7 +370,7 @@ class CallBridge:
                         self._check_spoken_numbers(final=False)
                         if "?" in tr.text:
                             if not self._question_pending:
-                                self._question_at = asyncio.get_event_loop().time()
+                                self._question_at = asyncio.get_running_loop().time()
                                 self._guard_event("question")
                             self._question_pending = True
                         self._check_leak()
@@ -414,7 +414,7 @@ class CallBridge:
             if fc.name in ("update_order", "submit_order") and self._question_pending:
                 self.guesses_blocked += 1
                 logger.info("blocked %s(%s): question not answered yet", fc.name, args)
-                now = asyncio.get_event_loop().time()
+                now = asyncio.get_running_loop().time()
                 self._guard_event(
                     "guess_blocked", name=fc.name, args=args,
                     since_question_s=round(now - self._question_at, 2) if self._question_at else None,

@@ -79,7 +79,7 @@ class TtsCaller:
 
     def __init__(self, lines: list[bytes], bridge: CallBridge, log: list) -> None:
         self.lines, self.bridge, self.log = lines, bridge, log
-        self.loop = asyncio.get_event_loop()
+        self.loop = asyncio.get_running_loop()
         self.index = -1                  # line being spoken; -1 = lead-in
         self.offset = 0
         self.state = "lead"
@@ -170,7 +170,7 @@ async def one_call(client, case: dict, voice: str, model: str, cache: Path) -> d
     http = HttpBackend("http://backend", transport=httpx.ASGITransport(app=app), timeout=10)
     bridge = CallBridge(ToolRouter(http, session_id))
     log: list = []
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     bridge.on_guard_event = lambda kind, **f: log.append((loop.time(), kind, f))
     caller = TtsCaller(lines, bridge, log)
     started = time.monotonic()
