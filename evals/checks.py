@@ -489,6 +489,164 @@ def check_submit_at_most_once(case: dict, run: dict) -> CheckResult:
     return False, detail
 
 
+# ---------------------------------------------------------------------------
+# Speech vs audio, and hallucinated items (information-only for now)
+# ---------------------------------------------------------------------------
+OUTPUT_BYTES_PER_SECOND = 24_000 * 2  # 24 kHz, 16-bit mono PCM
+# Normal speech is ~15 transcript chars per second of audio; allow plenty of slack.
+MAX_CHARS_PER_AUDIO_SECOND, CHAR_SLACK = 25, 40
+
+# Spoken-name variants the menu name alone would miss (eval heuristic, not menu data).
+_ITEM_ALIASES = {
+    "general-tsos-chicken": ["general tsos", "general tso"],
+    "white-rice": ["white rice"],
+    "beef-broccoli": ["beef and broccoli", "beef broccoli"],
+    "hot-sour-soup": ["hot and sour"],
+    "sweet-sour-pork": ["sweet and sour"],
+}
+_CONFIRMING = re.compile(
+    r"\b(got it|added|i've added|i have added|coming up|you've got|you got|done|all set)\b",
+    re.IGNORECASE)
+
+
+def _speech_key(text: str) -> str:
+    return " " + " ".join(re.findall(r"[a-z0-9]+", re.sub(r"['’]", "", text.lower()))) + " "
+
+
+def _item_patterns(menu: dict) -> list[tuple[str, str]]:
+    """(spoken form, item id), longest first, so "diet coke" wins over "coke"."""
+    forms = []
+    for item_id, item in menu.items():
+        name = _speech_key(item["name"]).strip()
+        variants = {name, name[:-1] if name.endswith("s") else name, *_ITEM_ALIASES.get(item_id, [])}
+        forms += [(v, item_id) for v in variants if v]
+    return sorted(forms, key=lambda f: -len(f[0]))
+
+
+def items_named(text: str, menu: Optional[dict] = None) -> set[str]:
+    """Menu item ids named in ``text`` (longest match first, each span once)."""
+    key, found = _speech_key(text), set()
+    for form, item_id in _item_patterns(menu or load_menu()):
+        token = f" {form} "
+        if token in key:
+            found.add(item_id)
+            key = key.replace(token, " | ")
+    return found
+
+
+def _audio_seconds_by_step(run: dict) -> Optional[dict[int, float]]:
+    audio = [e for e in run.get("events") or [] if e["type"] == "audio"]
+    if not audio:
+        return None
+    out: dict[int, float] = {}
+    for e in audio:
+        out[e["step"]] = out.get(e["step"], 0) + e["bytes"] / OUTPUT_BYTES_PER_SECOND
+    return out
+
+
+def check_transcript_matches_audio(case: dict, run: dict) -> CheckResult:
+    """The transcript has no more text than the turn's audio could carry. Text
+    beyond that (e.g. reasoning in the transcript) was not actually spoken."""
+    seconds = _audio_seconds_by_step(run)
+    if seconds is None:
+        return None  # reports from before audio was logged
+    bad = []
+    for index, step in enumerate(run["steps"]):
+        chars, secs = len(step["agent"]), seconds.get(index, 0.0)
+        if chars > MAX_CHARS_PER_AUDIO_SECOND * secs + CHAR_SLACK:
+            bad.append(f"step {index + 1}: {chars} chars for {secs:.1f}s of audio")
+    return (not bad), ("ok" if not bad else "transcript without matching audio: " + "; ".join(bad))
+
+
+def _sentences_with_seq(run: dict) -> list[tuple[str, int]]:
+    """Agent sentences in event order, each with the seq of the chunk ending it."""
+    out, buf, last = [], "", None
+    for ev in run.get("events") or []:
+        if ev["type"] == "caller" and buf.strip():
+            out.append((buf.strip(), last))
+            buf = ""
+        if ev["type"] != "agent_text":
+            continue
+        buf += ev["text"]
+        last = ev["seq"]
+        # Sentence ends: .?! then whitespace or a capital ("large?Sorry" has no space);
+        # never inside "12.49".
+        parts = re.split(r"(?<=[.?!])(?:\s+|(?=[A-Z]))", buf)
+        for done in parts[:-1]:
+            out.append((done.strip(), ev["seq"]))
+        buf = parts[-1]
+    if buf.strip():
+        out.append((buf.strip(), last))
+    return out
+
+
+def _order_ids(result: Any) -> Optional[set[str]]:
+    if (isinstance(result, dict) and "error" not in result
+            and isinstance(result.get("items"), list) and "subtotal" in result):
+        return {i.get("item_id") for i in result["items"]}
+    return None
+
+
+def check_unordered_item_confirmed(case: dict, run: dict, menu: Optional[dict] = None) -> CheckResult:
+    """Confirming language ("got it", "added", "coming up", "done"...) naming an
+    item that is not in the backend order at that moment. Questions are skipped;
+    a confirming sentence also covers the statement right after it ("Got it.
+    One regular General Tso's chicken.")."""
+    events = run.get("events")
+    if not events:
+        return None
+    menu = menu or load_menu()
+    order_at: list[tuple[int, set[str]]] = [(-1, set())]  # (seq, item ids in the order from then on)
+    for ev in events:
+        if ev["type"] == "tool_result" and ev.get("name") in ("update_order", "get_order", "submit_order"):
+            ids = _order_ids(ev["result"])
+            if ids is not None:
+                order_at.append((ev["seq"], ids))
+    sentences = _sentences_with_seq(run)
+    bad = []
+    for k, (sentence, seq) in enumerate(sentences):
+        if not _CONFIRMING.search(sentence) or "?" in sentence:
+            continue
+        covered = [sentence]
+        if k + 1 < len(sentences) and "?" not in sentences[k + 1][0]:
+            covered.append(sentences[k + 1][0])
+        in_order = [ids for s, ids in order_at if s < seq][-1]
+        for text in covered:
+            for item_id in sorted(items_named(text, menu) - in_order):
+                entry = f"{item_id} in {text[:60]!r}"
+                if entry not in bad:
+                    bad.append(entry)
+    return (not bad), ("ok" if not bad else "confirmed but not in the order: " + "; ".join(bad))
+
+
+def check_ungrounded_item_mentioned(case: dict, run: dict, menu: Optional[dict] = None) -> CheckResult:
+    """The agent names a menu item that neither the caller nor any function
+    result in this call has mentioned so far."""
+    events = run.get("events")
+    if not events:
+        return None
+    menu = menu or load_menu()
+    grounded: set[str] = set()
+    bad, buf = [], ""
+    for ev in events:
+        if ev["type"] == "caller":
+            grounded |= items_named(ev["text"], menu)
+            buf = ""
+        elif ev["type"] == "tool_result":
+            blob = json.dumps(ev.get("result"))
+            grounded |= {i for i in menu if f'"{i}"' in blob}
+        elif ev["type"] == "agent_text":
+            buf += ev["text"]
+            for item_id in sorted(items_named(buf, menu) - grounded):
+                bad.append(f"{item_id} (seq {ev['seq']})")
+                grounded.add(item_id)  # report each item once
+    return (not bad), ("ok" if not bad else "named without a source in this call: " + ", ".join(bad))
+
+
+# Reported for every run but never decide pass/fail (new heuristics, being calibrated).
+INFO_CHECKS = {"transcript_matches_audio", "unordered_item_confirmed", "ungrounded_item_mentioned"}
+
+
 CHECKS = {
     "completed": check_completed,
     "expected_calls": check_expected_calls,
@@ -504,6 +662,9 @@ CHECKS = {
     "wrong_number_corrected": check_wrong_number_corrected,
     "submit_at_most_once": check_submit_at_most_once,
     "get_order_before_submit": check_get_order_before_submit,
+    "transcript_matches_audio": check_transcript_matches_audio,
+    "unordered_item_confirmed": check_unordered_item_confirmed,
+    "ungrounded_item_mentioned": check_ungrounded_item_mentioned,
 }
 
 
@@ -517,7 +678,7 @@ def evaluate(case: dict, run: dict) -> dict[str, dict]:
         result = fn(case, run)
         if result is not None:
             out[name] = {"passed": result[0], "detail": result[1],
-                         "counted": only is None or name in only,
+                         "counted": (only is None or name in only) and name not in INFO_CHECKS,
                          "warning": result[0] and result[1].startswith(WARNING_PREFIX)}
     return out
 

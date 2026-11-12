@@ -472,7 +472,7 @@ def test_isolated_quota_error_is_not_scored(monkeypatch, tmp_path, capsys):
     code, calls = _fake_main(monkeypatch, tmp_path, [None, "handshake HTTP 429: <empty>"])
     assert len(calls) == 6 and code == 0  # one lost run; the other 5 passed
     out = capsys.readouterr().out
-    assert "not scored, rate-limit/quota errors (1)" in out
+    assert "not scored, infrastructure errors (quota / machine sleep) (1)" in out
 
 
 def test_turn_not_done_until_model_answers_the_tool_response():
@@ -503,3 +503,96 @@ def test_turn_not_done_until_model_answers_the_tool_response():
         return events.qsize()
 
     assert asyncio.run(go()) == 0  # waited for (and consumed) the late reply
+
+
+# -- speech vs audio, hallucinated items --------------------------------------------------
+from evals.checks import (
+    INFO_CHECKS,
+    check_transcript_matches_audio,
+    check_ungrounded_item_mentioned,
+    check_unordered_item_confirmed,
+    items_named,
+)
+
+SECOND = 48_000  # bytes of 24 kHz 16-bit audio
+
+
+def test_items_named_prefers_longest_and_aliases():
+    assert items_named("One Diet Coke and a Coke", MENU) == {"diet-coke", "coke"}
+    assert items_named("a large spicy General Tso's", MENU) == {"general-tsos-chicken"}
+    assert items_named("two egg rolls, one egg roll", MENU) == {"egg-rolls"}
+    assert items_named("vegetable, chicken, beef, or shrimp?", MENU) == set()
+
+
+def test_transcript_without_matching_audio_is_flagged():
+    ok = ev_run({"type": "audio", "step": 0, "bytes": 5 * SECOND})
+    ok["steps"] = [step(agent="x" * 69)]
+    assert check_transcript_matches_audio({}, ok) == (True, "ok")
+    leak = ev_run({"type": "audio", "step": 0, "bytes": 9 * SECOND})
+    leak["steps"] = [step(agent="x" * 696)]
+    passed, detail = check_transcript_matches_audio({}, leak)
+    assert not passed and "696 chars for 9.0s" in detail
+    assert check_transcript_matches_audio({}, ev_run()) is None  # no audio logged
+
+
+def order(*ids):
+    return {"type": "tool_result", "name": "update_order",
+            "result": {"subtotal": 1.0, "items": [{"item_id": i} for i in ids]}}
+
+
+def test_confirming_an_item_not_in_the_order():
+    hallucinated = ev_run(caller("I want fried rice."), said("Got it. One regular General Tso's chicken."))
+    passed, detail = check_unordered_item_confirmed({}, hallucinated, MENU)
+    assert not passed and "general-tsos-chicken" in detail
+
+    real = ev_run(caller("two egg rolls"), order("egg-rolls"), said("Got it, two egg rolls. Anything else?"))
+    assert check_unordered_item_confirmed({}, real, MENU)[0]
+
+
+def test_confirming_questions_are_not_counted():
+    r = ev_run(caller("fried rice"), said("Got it, would you like vegetable or shrimp fried rice?"),
+               said("Got it. Which size General Tso's?Sorry, regular or large?"))
+    assert check_unordered_item_confirmed({}, r, MENU)[0]
+
+
+def test_item_removed_then_confirmed_is_flagged():
+    r = ev_run(caller("coke"), order("coke"), order(), said("Done, one Coke."))
+    assert not check_unordered_item_confirmed({}, r, MENU)[0]
+
+
+def test_ungrounded_item_mention():
+    r = ev_run(caller("I want fried rice."), said("Sure. Our General Tso's chicken is great."))
+    passed, detail = check_ungrounded_item_mentioned({}, r, MENU)
+    assert not passed and "general-tsos-chicken" in detail
+    searched = ev_run(caller("chicken?"), {"type": "tool_result", "name": "search_menu",
+                                           "result": {"matches": [{"id": "general-tsos-chicken"}]}},
+                      said("We have General Tso's chicken."))
+    assert check_ungrounded_item_mentioned({}, searched, MENU)[0]
+
+
+def test_new_heuristic_checks_never_decide_pass_fail():
+    r = ev_run(caller("I want fried rice."), said("Got it. One regular General Tso's chicken."))
+    r["steps"] = [step(say="I want fried rice.", agent="Got it. One regular General Tso's chicken.")]
+    checks = evaluate({"steps": [{"say": "I want fried rice."}]}, r)
+    for name in INFO_CHECKS & set(checks):
+        assert checks[name]["counted"] is False
+    assert not checks["unordered_item_confirmed"]["passed"] and run_passed(checks)
+
+
+# -- per-session timeout / machine sleep ---------------------------------------------------
+def test_sleep_runs_are_not_scored_and_do_not_stop_the_run(monkeypatch, tmp_path, capsys):
+    from evals.run import SLEEP_PREFIX, is_sleep_error
+
+    sleep = f"{SLEEP_PREFIX} run took 12000s, session timeout is 300s (was: session timeout after 300s)"
+    assert is_sleep_error(sleep) and not is_sleep_error("session timeout after 300s")
+    code, calls = _fake_main(monkeypatch, tmp_path, [sleep, sleep, sleep])
+    assert len(calls) == 6 and code == 0   # three sleeps in a row: not a quota stop, not scored
+    assert "SLEEP" in capsys.readouterr().out
+
+
+def test_session_timeout_option():
+    pytest.importorskip("yaml")
+    from evals.run import parse_args
+
+    assert parse_args([]).session_timeout == 300
+    assert parse_args(["--session-timeout", "90"]).session_timeout == 90

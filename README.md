@@ -295,6 +295,17 @@ Explicitly out of scope for this experiment:
   it aloud. Speech is not a reliable channel for an ID: in Live API evals the
   model has occasionally spoken a wrong number before correcting itself (the
   bridge now detects this and sends a correction note), and callers can mishear.
+- **No silence after repeated leaks.** The bridge's audio cut asks the agent to
+  re-answer at most twice per call; from the third cut, the caller hears silence
+  for that turn. Play a fixed fallback line ("Sorry, could you say that
+  again?") or transfer to staff instead.
+- **Skip the re-answer when it isn't needed.** If the agent's speech before a
+  cut already ended a sentence or question (the leak came after a complete
+  reply), cut without asking for a re-answer; today the caller hears the same
+  answer twice.
+- **Barge-in latency.** In `barge_in_after_yes` the p90 time from the caller's
+  turn to the agent's first audio is 4.0 s (other cases: 1.2–2.4 s).
+  Investigate.
 
 ## Review documents
 

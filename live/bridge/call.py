@@ -25,7 +25,13 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
-from live.bridge.tools import ToolRouter, is_successful_submit, load_declarations
+from live.bridge.tools import (
+    INVALID_ARGUMENTS,
+    ToolRouter,
+    error_result,
+    is_successful_submit,
+    load_declarations,
+)
 
 logger = logging.getLogger("live_bridge")
 
@@ -149,8 +155,10 @@ def build_live_config(
         "response_modalities": ["AUDIO"],
         "system_instruction": load_system_instruction(),
         "tools": [{"function_declarations": list(load_declarations().values())}],
-        # The confirmation-number guard reads the agent's transcript.
+        # The confirmation-number and audio-cut guards read the agent's transcript;
+        # the guessed-answer guard needs to know when the caller has spoken.
         "output_audio_transcription": {},
+        "input_audio_transcription": {},
     }
     if language:
         config["speech_config"] = {"language_code": language}
@@ -183,6 +191,30 @@ NO_NUMBER_NOTE = ("System note: no order has been placed yet, so there is no "
                   "confirmation number. Don't give one until the order is placed.")
 
 
+# Transcript text that is never speech: JSON braces, backticks (code), a markup tag
+# (<context>, <no speech>), a markdown rule, bold, or a bullet line ("*   *Step 1").
+# Conservative on purpose: normal spoken replies contain none of these.
+LEAK_MARKER = re.compile(r"[{}`]|<[a-z][a-z ]*>|^\s*-{3,}\s*$|\*\*|^\s*\*\s",
+                         re.IGNORECASE | re.MULTILINE)
+MAX_REANSWERS_PER_CALL = 2
+# After a cut, send the re-answer note anyway if the turn has not ended by then
+# (seen live: a leaking model kept generating and never completed the turn).
+REANSWER_GRACE_S = 2.0
+REANSWER_NOTE = ("System note: your last reply was cut off because it contained internal text, "
+                 "not speech. Briefly answer the caller's last question again, in plain spoken "
+                 "words only.")
+# Caller speech onset from mic energy (16 kHz 16-bit PCM). Fail-open: noise that
+# crosses the threshold only releases the guard early, it never blocks a call.
+CALLER_SPEECH_PEAK = 1500          # peak sample level (of 32767) counted as voice
+CALLER_SPEECH_MIN_MS = 120         # sustained this long = the caller started speaking
+CALLER_SILENCE_RESET_MS = 300      # this much quiet ends the current utterance
+INPUT_BYTES_PER_MS = 16_000 * 2 // 1000
+
+UNANSWERED_QUESTION_ERROR = (
+    "You asked the caller a question and they have not answered yet. Wait for their "
+    "answer; don't assume it. Do not call this function again until the caller speaks.")
+
+
 def submit_note(confirmation_number: str) -> str:
     return (
         f"System note: the order was submitted, confirmation number "
@@ -202,7 +234,9 @@ class AudioPort(Protocol):
 
 
 class CallBridge:
-    def __init__(self, router: ToolRouter, language: Optional[str] = DEFAULT_LANGUAGE) -> None:
+    def __init__(self, router: ToolRouter, language: Optional[str] = DEFAULT_LANGUAGE,
+                 speech_peak: int = CALLER_SPEECH_PEAK,
+                 speech_min_ms: int = CALLER_SPEECH_MIN_MS) -> None:
         self.router = router
         self.language = language
         self.resumption_handle: Optional[str] = None
@@ -223,6 +257,24 @@ class CallBridge:
         self._turn_scanned = 0  # offset up to which numbers were checked
         self._early: list[str] = []  # numbers spoken before any submit result
         self._corrected: set[str] = set()  # wrong numbers already noted
+        # Audio-cut guard: stop forwarding a turn's audio once its transcript leaks.
+        self.audio_muted = False
+        self._clear_playback = False  # drop audio already queued for the caller
+        self.audio_cuts = 0
+        self._forced_reanswer: Optional[asyncio.Task] = None
+        # Guessed-answer guard: agent asked a question, caller has not spoken since.
+        # Released by whichever caller-speech signal comes first: mic energy
+        # (immediate), server voice activity, the input transcript (lags), or
+        # caller_input() in text mode.
+        self._question_pending = False
+        self._question_at: Optional[float] = None
+        self.guesses_blocked = 0
+        self._speech_peak, self._speech_min_ms = speech_peak, speech_min_ms
+        self._loud_ms = self._quiet_ms = 0.0
+        self._caller_speaking = False
+        self.last_caller_signal: dict[str, float] = {}  # signal kind -> loop time
+        # Optional hook for guard events (the eval runner logs them).
+        self.on_guard_event: Optional[Any] = None
 
     @property
     def awaiting_reply(self) -> bool:
@@ -241,6 +293,44 @@ class CallBridge:
 
     def attach(self, session: Any) -> None:
         self._session = session
+
+    def caller_input(self) -> None:
+        """The caller said something (text mode, where there is no caller audio)."""
+        self._caller_spoke("text")
+
+    def caller_audio(self, chunk: bytes) -> None:
+        """Every mic chunk sent upstream: detect the onset of caller speech from
+        energy, with no transcript lag."""
+        ms = len(chunk) / INPUT_BYTES_PER_MS
+        if pcm16_peak(chunk) >= self._speech_peak:
+            self._loud_ms += ms
+            self._quiet_ms = 0.0
+            if not self._caller_speaking and self._loud_ms >= self._speech_min_ms:
+                self._caller_speaking = True
+                self._caller_spoke("energy")
+        else:
+            self._quiet_ms += ms
+            if self._quiet_ms >= CALLER_SILENCE_RESET_MS:
+                self._loud_ms = 0.0
+                self._caller_speaking = False
+
+    def _caller_spoke(self, kind: str) -> None:
+        now = asyncio.get_running_loop().time()
+        previous = self.last_caller_signal.get(kind)
+        self.last_caller_signal[kind] = now
+        # One event per utterance and signal (transcript chunks arrive ~0.2 s apart).
+        if self._question_pending or previous is None or now - previous >= 1.0:
+            self._guard_event("caller_speech", signal=kind, released=self._question_pending)
+        self._question_pending = False
+
+    def take_clear_request(self) -> bool:
+        """True once after an audio cut: queued playback must be dropped."""
+        requested, self._clear_playback = self._clear_playback, False
+        return requested
+
+    def _guard_event(self, kind: str, **fields: Any) -> None:
+        if self.on_guard_event:
+            self.on_guard_event(kind, **fields)
 
     # -- server messages ----------------------------------------------------
     async def on_message(self, msg: Any) -> None:
@@ -264,15 +354,26 @@ class CallBridge:
                 if call_id in self._sent_submits:
                     self._queue_note(self._sent_submits.pop(call_id))
             await self._maybe_flush_notes()
+        activity = getattr(msg, "voice_activity", None)
+        if activity is not None and "START" in str(getattr(activity, "voice_activity_type", "")):
+            self._caller_spoke("vad")
         content = getattr(msg, "server_content", None)
         if content:
             for attr, who in (("input_transcription", "caller"), ("output_transcription", "agent")):
                 tr = getattr(content, attr, None)
                 if tr and getattr(tr, "text", None):
                     logger.info("[%s] %s", who, tr.text)
-                    if who == "agent":
+                    if who == "caller":
+                        self._caller_spoke("transcript")
+                    else:
                         self._turn_text += tr.text
                         self._check_spoken_numbers(final=False)
+                        if "?" in tr.text:
+                            if not self._question_pending:
+                                self._question_at = asyncio.get_running_loop().time()
+                                self._guard_event("question")
+                            self._question_pending = True
+                        self._check_leak()
             if content.model_turn:
                 self._model_idle = False
             if content.turn_complete or content.interrupted:
@@ -281,6 +382,10 @@ class CallBridge:
                     self._queue_text("no-number", NO_NUMBER_NOTE)
                     self._early.clear()
                 self._turn_text, self._turn_scanned = "", 0
+                self.audio_muted = False  # the next turn (e.g. the re-answer) is heard again
+                if self._forced_reanswer:
+                    self._forced_reanswer.cancel()  # the turn ended normally
+                    self._forced_reanswer = None
                 self._model_idle = True
                 await self._maybe_flush_notes()
 
@@ -306,6 +411,16 @@ class CallBridge:
                 logger.info("skipping cancelled call %s (%s)", fc.id, fc.name)
                 continue
             args = dict(fc.args or {})
+            if fc.name in ("update_order", "submit_order") and self._question_pending:
+                self.guesses_blocked += 1
+                logger.info("blocked %s(%s): question not answered yet", fc.name, args)
+                now = asyncio.get_running_loop().time()
+                self._guard_event(
+                    "guess_blocked", name=fc.name, args=args,
+                    since_question_s=round(now - self._question_at, 2) if self._question_at else None,
+                    since_signal_s={k: round(now - t, 2) for k, t in self.last_caller_signal.items()})
+                responses.append((fc, error_result(INVALID_ARGUMENTS, UNANSWERED_QUESTION_ERROR)))
+                continue
             result = await self.router.call(fc.name, args)
             outcome = result["error"]["code"] if "error" in result else "ok"
             logger.info("tool %s(%s) -> %s", fc.name, args, outcome)
@@ -328,6 +443,30 @@ class CallBridge:
             self._set_confirmation(number)
         self._sent_submits.update(submits)
         await self._maybe_flush_notes()
+
+    # -- audio-cut guard ------------------------------------------------------
+    def _check_leak(self) -> None:
+        if self.audio_muted or not LEAK_MARKER.search(self._turn_text):
+            return
+        self.audio_muted = True
+        self._clear_playback = True
+        self.audio_cuts += 1
+        logger.warning("leak in agent transcript: audio cut for the rest of the turn")
+        self._guard_event("audio_cut", text=self._turn_text[-200:])
+        if self.audio_cuts <= MAX_REANSWERS_PER_CALL:
+            self._queue_text(f"reanswer-{self.audio_cuts}", REANSWER_NOTE)
+            self._forced_reanswer = asyncio.get_running_loop().create_task(
+                self._reanswer_if_turn_hangs(self.audio_cuts))
+
+    async def _reanswer_if_turn_hangs(self, cut: int) -> None:
+        """The muted turn has not ended after the grace period: send the
+        re-answer note now (new input interrupts the model's generation)."""
+        await asyncio.sleep(REANSWER_GRACE_S)
+        if self.audio_muted and self.audio_cuts == cut:
+            logger.warning("turn still running %.1fs after an audio cut: sending the re-answer note now",
+                           REANSWER_GRACE_S)
+            self._guard_event("reanswer_forced")
+            await self._maybe_flush_notes(force=True)
 
     # -- confirmation-number guard -------------------------------------------
     def _set_confirmation(self, number: str) -> None:
@@ -365,8 +504,8 @@ class CallBridge:
             self._noted.add(key)
             self._notes.append(note)
 
-    async def _maybe_flush_notes(self) -> None:
-        if not self._model_idle or self._session is None:
+    async def _maybe_flush_notes(self, force: bool = False) -> None:
+        if (not self._model_idle and not force) or self._session is None:
             return
         while self._notes:
             # Realtime text, not send_client_content: the SDK warns against
@@ -418,6 +557,7 @@ class CallBridge:
             while (chunk := await audio.read()) is not None:
                 if self.stats:
                     self.stats.mic(chunk)
+                self.caller_audio(chunk)
                 await session.send_realtime_input(
                     audio={"data": chunk, "mime_type": INPUT_AUDIO_MIME}
                 )
@@ -430,13 +570,19 @@ class CallBridge:
                     content = msg.server_content
                     if content and content.interrupted:
                         await audio.clear()
+                    muted = self.audio_muted
+                    # Transcript first: a leak marker in this message stops its audio too.
+                    await self.on_message(msg)
+                    muted = muted or self.audio_muted
+                    if self.take_clear_request():
+                        await audio.clear()
                     if content and content.model_turn:
                         for part in content.model_turn.parts or []:
                             if part.inline_data and part.inline_data.data:
                                 if self.stats:
                                     self.stats.model_audio(part.inline_data.data)
-                                await audio.play(part.inline_data.data)
-                    await self.on_message(msg)
+                                if not muted:
+                                    await audio.play(part.inline_data.data)
                     if msg.go_away:
                         return
 
